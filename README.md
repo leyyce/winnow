@@ -1,1 +1,1 @@
-# winnow – Data QA framework for user submitted data in citizen science projects
+# winnow – QA framework for user submitted data in citizen science projects
