@@ -1,0 +1,52 @@
+# .dockerignore
+# Files excluded from the Docker build context.
+# Keeping this tight speeds up `docker build` and prevents secrets leaking
+# into image layers.
+
+# ── Version control ───────────────────────────────────────────────────────────
+.git
+.gitignore
+.github
+
+# ── Python artefacts ─────────────────────────────────────────────────────────
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.egg-info
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+
+# ── Virtual environments (never bake the host venv into the image) ────────────
+.venv/
+venv/
+env/
+
+# ── Secrets (critical – never include .env files in images) ──────────────────
+.env
+.env.*
+!.env.example
+
+# ── Docker files themselves (not needed inside the API image) ────────────────
+Dockerfile*
+compose*.yaml
+.dockerignore
+
+# ── Caddy config (only needed at the compose level) ──────────────────────────
+Caddyfile*
+
+# ── OS artefacts ─────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Editor ───────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo

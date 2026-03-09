@@ -1,0 +1,45 @@
+# Caddyfile
+#
+# One file for both dev and prod.
+#
+# Caddy automatically selects the right TLS strategy based on the domain:
+#   *.localhost  → internal CA (self-signed, trusted via `caddy trust`)
+#   real domain  → Let's Encrypt (automatic, no config needed)
+#
+# The only variable that changes between environments is APP_DOMAIN (via .env).
+#
+# Dev TLS setup (one-time, after first `docker compose -f compose.dev.yaml up`):
+#   docker compose -f compose.dev.yaml exec caddy caddy trust
+#   Restart your browser, then visit https://{APP_DOMAIN}.localhost
+
+{
+    # Used by Let's Encrypt for cert expiry notifications.
+    # Ignored by Caddy when issuing internal certs for .localhost.
+    email {$ACME_EMAIL}
+}
+
+{$APP_DOMAIN} {
+    reverse_proxy api:8000 {
+        # Pass real client IP and scheme to FastAPI.
+        # FastAPI must be started with --proxy-headers (set in Dockerfile CMD).
+        header_up X-Forwarded-Proto {scheme}
+        header_up X-Forwarded-For  {remote_host}
+        header_up X-Real-IP        {remote_host}
+    }
+
+    # Security headers — Caddy applies these in both dev and prod.
+    # They're harmless locally and mean you test with realistic headers.
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options    "nosniff"
+        X-Frame-Options           "DENY"
+        Referrer-Policy           "strict-origin-when-cross-origin"
+        Permissions-Policy        "geolocation=(), camera=(), microphone=()"
+        -Server
+    }
+
+    log {
+        output stdout
+        format console
+    }
+}

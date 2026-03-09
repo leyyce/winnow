@@ -1,0 +1,62 @@
+# compose.dev.yaml – fully self-contained development stack.
+#
+# Make this the default locally so plain `docker compose` commands work:
+#
+#   Add to .env (Docker Compose reads this automatically):
+#     COMPOSE_FILE=compose.dev.yaml
+#
+#   Or pass the flag explicitly:
+#     docker compose -f compose.dev.yaml up
+#
+# SSL setup (one-time, after first `docker compose up`):
+#   docker compose exec caddy caddy trust
+#   Restart your browser, then visit https://{APP_DOMAIN}.localhost
+
+name: ${APP_NAME:-winnow}-dev
+
+services:
+
+  # ── FastAPI application (dev) ─────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: dev
+    volumes:
+      # Bind-mount app source for instant hot-reload – no image rebuild needed.
+      # We mount only the app subfolder to avoid shadowing the container's /app/pyproject.toml etc.
+      - ./app:/app/app:ro
+      # Protect the container's .venv from host shadowing
+      - /app/.venv
+    env_file:
+      - .env
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # ── Caddy (local TLS via internal CA) ────────────────────────────────────
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    env_file:
+      - .env
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  caddy_data:
+  caddy_config:

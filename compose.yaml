@@ -1,0 +1,57 @@
+# compose.yaml – fully self-contained production stack.
+#
+# Usage:
+#   docker compose up -d --build
+#
+# Requirements:
+#   • APP_DOMAIN in .env must have a DNS A/AAAA record pointing to this server
+#   • Ports 80 and 443 must be reachable from the internet (ACME HTTP-01 challenge)
+#   • ACME_EMAIL in .env is used by Caddy to register with Let's Encrypt
+
+name: ${APP_NAME:-winnow}
+
+services:
+
+  # ── FastAPI application (prod) ────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: prod
+    restart: unless-stopped
+    env_file:
+      - .env
+    expose:
+      - "8000"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # ── Caddy (automatic Let's Encrypt TLS) ──────────────────────────────────
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    env_file:
+      - .env
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  caddy_data:
+  caddy_config:
