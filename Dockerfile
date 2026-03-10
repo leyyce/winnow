@@ -14,7 +14,7 @@
 
 
 # ── base: shared tooling ──────────────────────────────────────────────────────
-FROM python:3.12-slim-bookworm AS base
+FROM python:3.14-slim-bookworm AS base
 
 # curl is used by the HEALTHCHECK in both dev and prod.
 RUN apt-get update \
