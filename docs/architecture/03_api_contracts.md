@@ -114,8 +114,8 @@ graph TD
 
     U --> U1["user_id: UUID"]
     U --> U2["username: str"]
-    U --> U3["role: enum(citizen, trusted, expert, admin)"]
-    U --> U4["trust_level: int (0–10)"]
+    U --> U3["role: str (project-specific)"]
+    U --> U4["trust_level: int (project-specific scale)"]
     U --> U5["total_submissions: int"]
     U --> U6["account_created_at: datetime"]
 
@@ -143,8 +143,8 @@ class SubmissionMetadata(BaseModel):
 class UserContext(BaseModel):
     user_id: UUID
     username: str
-    role: Literal["citizen", "trusted", "expert", "admin"]
-    trust_level: int = Field(ge=0, le=10)
+    role: str = Field(min_length=1)      # project-specific roles
+    trust_level: int = Field(ge=0)        # scale is project-specific
     total_submissions: int = Field(ge=0)
     account_created_at: datetime
 
@@ -375,7 +375,9 @@ class FinalizationRequest(BaseModel):
     "user_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
     "recommended_delta": 2,
     "reason": "5 consecutive approved submissions (streak bonus)",
-    "current_trust_level": 3
+    "current_trust_level": 3,
+    "project_min_trust": 0,
+    "project_max_trust": 500
   },
   "finalized_at": "2026-03-11T09:15:00Z"
 }
@@ -391,6 +393,8 @@ class TrustAdjustment(BaseModel):
     recommended_delta: int               # positive = reward, negative = penalty
     reason: str
     current_trust_level: int             # as received on the wire at submission time
+    project_min_trust: int               # project-configured minimum trust value
+    project_max_trust: int               # project-configured maximum trust value
 
 class FinalizationResponse(BaseModel):
     submission_id: UUID
@@ -403,7 +407,7 @@ class FinalizationResponse(BaseModel):
 > **Important:** The `trust_adjustment` is a **recommendation**. Laravel receives it and decides whether to apply it to `users.trust_level`. Winnow never directly modifies the client’s user data.
 
 
-> **Race-condition safeguard:** The `TrustAdjustment` response deliberately omits a `recommended_new_level` field. Returning a pre-computed new level would tempt the client to blindly overwrite its DB value, causing race conditions when parallel submissions produce concurrent deltas. The client **MUST** apply only the `recommended_delta` atomically (e.g., `UPDATE users SET trust_level = CLAMP(trust_level + delta, 0, 10) WHERE id = ?`).
+> **Race-condition safeguard:** The `TrustAdjustment` response deliberately omits a `recommended_new_level` field. Returning a pre-computed new level would tempt the client to blindly overwrite its DB value, causing race conditions when parallel submissions produce concurrent deltas. The client **MUST** apply only the `recommended_delta` atomically, using the returned bounds to clamp the result (e.g., `UPDATE users SET trust_level = CLAMP(trust_level + delta, project_min_trust, project_max_trust) WHERE id = ?`). The trust scale boundaries (`project_min_trust`, `project_max_trust`) are project-specific and configured in the Winnow registry.
 
 ---
 
@@ -523,8 +527,8 @@ GET /api/v1/tasks/available?project_id=tree-app&user_trust=5&user_role=trusted
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `project_id` | string | Yes | Which project's submissions to query. |
-| `user_trust` | int (0–10) | Yes | The reviewer's current trust level (sent by the client). |
-| `user_role` | string | No | The reviewer's role (e.g., `citizen`, `trusted`, `expert`). Defaults to `citizen`. |
+| `user_trust` | int | Yes | The reviewer's current trust level (sent by the client). Scale is project-specific. |
+| `user_role` | string | No | The reviewer's role. Project-specific (e.g., roles defined in the project's governance config). |
 | `page` | int | No | Page number for pagination (default: 1). |
 | `per_page` | int | No | Items per page (default: 20, max: 100). |
 
