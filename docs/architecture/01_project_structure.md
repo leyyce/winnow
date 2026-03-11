@@ -202,16 +202,16 @@ The scoring pipeline (Stages 1 → 2 → 4-input) runs synchronously on submissi
 |---|---|
 | **Role** | The single top-level domain that wires together schemas, scoring rules, and governance policies for each registered project. Decoupled from all three sub-domains it composes. |
 | **Contains** | `ProjectRegistryEntry` dataclass, `_Registry` singleton, `ProjectBuilder` ABC, and one concrete `ProjectBuilder` per project under `projects/`. |
-| **Key abstraction** | `ProjectBuilder` (Open/Closed): adding a new project means creating a new subclass in `registry/projects/` and registering it in `bootstrap.py` — no existing code changes. |
+| **Key abstraction** | `ProjectBuilder` (Open/Closed): adding a new project means creating a new subclass in `registry/projects/` — `bootstrap.py` auto-discovers and loads it, no existing code changes required. |
 | **Rule** | No HTTP, no DB imports. The registry is populated at startup by `bootstrap.py` and consumed by services via dependency injection. |
 
 ### `app/bootstrap.py` — Startup Bootstrap
 
 | Concern | Detail |
 |---|---|
-| **Role** | Initializes the registry singleton and loads all active `ProjectBuilder` instances at application startup. |
+| **Role** | Auto-discovers and loads all active `ProjectBuilder` instances at application startup using `pkgutil`, `importlib`, and `inspect`. Scans every module in `app.registry.projects`, finds concrete `ProjectBuilder` subclasses, and calls `registry.load(builder)` for each. |
 | **Usage** | Called once from the FastAPI `lifespan` handler in `main.py`. Auto-executes on import so tests work without an explicit call. |
-| **Rule** | Adding a new project = import its `ProjectBuilder` here and call `registry.load(MyProjectBuilder())`. |
+| **Rule** | Adding a new project = create `app/registry/projects/<name>.py` with a `ProjectBuilder` subclass. `bootstrap.py` requires **no changes**. See `02_architecture_patterns.md § 3b` for the full auto-discovery flow. |
 
 ### `app/scoring/` — Domain Layer (Scoring Core)
 

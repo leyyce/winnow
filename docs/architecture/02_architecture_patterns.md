@@ -14,7 +14,7 @@
 | **Envelope Pattern** | `app/schemas/envelope.py` | Separate stable metadata from variable domain payloads. |
 | **Registry Pattern** | `app/registry/` | Dynamically resolve which Pydantic schema (Stage 1), scoring strategies (Stage 2 + 4), and governance policy apply to a given `project_id`. |
 | **Builder Pattern** | `app/registry/base.py` + `app/registry/projects/` | `ProjectBuilder` ABC defines a standard interface for composing a `ProjectRegistryEntry`. Each project implements its own builder — no registry code changes when a new project is added. |
-| **Bootstrap Pattern** | `app/bootstrap.py` | Single startup entry point that instantiates all active `ProjectBuilder`s and loads them into the registry. Ensures the registry is ready before any request is served. |
+| **Bootstrap Pattern** | `app/bootstrap.py` | Auto-discovery startup module: dynamically scans `app.registry.projects`, finds every concrete `ProjectBuilder` subclass, and loads each into the registry — no manual imports required when adding a new project. |
 | **Trust Advisor Pattern** | `app/scoring/common/trust_advisor.py` | Winnow advises, the client decides. Computes per-submission `trust_adjustment` deltas based on ground-truth finalization signals. |
 | **Task Orchestration Pattern** | `app/governance/` + `app/services/governance_service.py` | Winnow is the **Governance Authority**: it determines review requirements (Target State) per submission and controls which tasks are available to which reviewers. Client projects act as Task Clients. |
 | **Repository Pattern** | `app/services/` + `app/models/` | Abstract database access behind service functions so domain logic stays DB-free. |
@@ -104,7 +104,7 @@ To add a scoring rule for a new project (e.g., a biodiversity observation app):
 2. Implement `ScoringRule.evaluate(...)`.
 3. Register it in the project's `ProjectBuilder.build()` method (e.g., `app/registry/projects/biodiversity.py`).
 
-**No existing code needs to change.** This is the [Open/Closed Principle](https://en.wikipedia.org/wiki/Open%E2%80%93closed_principle) in action.
+**No existing code needs to change — including `bootstrap.py`.** The auto-discovery mechanism (see [Section 3b](#3b-bootstrap-pattern--auto-discovery)) picks up the new builder automatically. This is the [Open/Closed Principle](https://en.wikipedia.org/wiki/Open%E2%80%93closed_principle) in action.
 
 ---
 
@@ -140,7 +140,7 @@ The registry domain lives in `app/registry/` and is composed of three layers:
 | `manager.py` | `_Registry` singleton + `ProjectRegistryEntry` dataclass. Value-agnostic — stores whatever a builder hands it. |
 | `base.py` | `ProjectBuilder` ABC — declares `project_id` property and `build() → ProjectRegistryEntry` method. |
 | `projects/<name>.py` | Concrete builder per project — the single authoritative source for all project-specific numeric config. |
-| `app/bootstrap.py` | Instantiates builders and calls `registry.load(builder)` at startup. |
+| `app/bootstrap.py` | Auto-discovers every concrete `ProjectBuilder` in `app.registry.projects` via `pkgutil`/`importlib`/`inspect` and calls `registry.load(builder)` for each. Adding a new project file is sufficient — `bootstrap.py` never needs to be edited. |
 
 ### What the Registry Provides
 
@@ -256,6 +256,58 @@ The registry can be populated from:
 - **A combination** — code defines available rule classes; DB stores weights and thresholds.
 
 For the Bachelor's thesis prototype, starting with code-based configuration and migrating to DB-backed configuration later is the recommended approach.
+
+---
+
+## 3b. Bootstrap Pattern — Auto-Discovery
+
+The bootstrap module (`app/bootstrap.py`) is responsible for populating the registry at application startup. Rather than requiring manual imports for every new project, it uses Python's standard introspection tools to discover all registered project builders automatically.
+
+### How It Works
+
+1. `pkgutil.walk_packages` recursively iterates every module inside the `app.registry.projects` package.
+2. `importlib.import_module` imports each module, triggering its top-level definitions.
+3. `inspect.getmembers` enumerates all classes exported by the module.
+4. Any class that is a concrete subclass of `ProjectBuilder` (i.e., `issubclass(cls, ProjectBuilder)` and `cls is not ProjectBuilder`) and is **defined in that module** (not just imported into it) is instantiated and passed to `registry.load(builder)`.
+
+### Developer Experience
+
+To add a new project to Winnow:
+
+1. Create `app/registry/projects/<new_project>.py`.
+2. Implement a concrete `ProjectBuilder` subclass inside it.
+3. **Done.** `bootstrap.py` discovers and loads it automatically on next startup.
+
+No changes to `bootstrap.py`, `registry/manager.py`, or any other infrastructure file are required.
+
+### Integration with FastAPI
+
+`app/bootstrap.py` is imported by `app/main.py` inside the FastAPI `lifespan` context, ensuring the registry is fully populated before the first request is served. For tests, importing `app.bootstrap` at the top of the test file (or in `conftest.py`) is sufficient.
+
+```python
+# Conceptual pseudo-code — NOT implementation
+
+import pkgutil, importlib, inspect
+from app.registry.base import ProjectBuilder
+from app.registry.manager import registry
+import app.registry.projects as _projects_pkg
+
+def _discover_and_load() -> None:
+    for finder, module_name, _ in pkgutil.walk_packages(
+        path=_projects_pkg.__path__,
+        prefix=_projects_pkg.__name__ + ".",
+    ):
+        module = importlib.import_module(module_name)
+        for _, obj in inspect.getmembers(module, inspect.isclass):
+            if (
+                issubclass(obj, ProjectBuilder)
+                and obj is not ProjectBuilder
+                and obj.__module__ == module.__name__  # defined here, not re-imported
+            ):
+                registry.load(obj())
+
+_discover_and_load()
+```
 
 ---
 
