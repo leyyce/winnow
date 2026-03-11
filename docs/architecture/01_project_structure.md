@@ -25,6 +25,7 @@ winnow/
 ├── app/                            # ← Application root (Python package)
 │   ├── __init__.py
 │   ├── main.py                     # FastAPI application factory & lifespan
+│   ├── bootstrap.py                # Startup bootstrap — loads active projects into the registry
 │   │
 │   ├── api/                        # Presentation layer — HTTP interface
 │   │   ├── __init__.py
@@ -63,9 +64,16 @@ winnow/
 │   │   ├── submission_service.py   # Receives envelope → persists → triggers scoring
 │   │   └── governance_service.py   # Task orchestration — determines review requirements & eligible reviewers
 │   │
-│   ├── scoring/                    # Domain layer — scoring strategies (the core)
+│   ├── registry/                   # Top-level registry domain — wires schemas, scoring & governance
+│   │   ├── __init__.py             # Re-exports: ProjectRegistryEntry, ProjectBuilder, registry
+│   │   ├── base.py                 # ProjectBuilder ABC — interface every project must implement
+│   │   ├── manager.py              # _Registry singleton + ProjectRegistryEntry dataclass
+│   │   └── projects/               # One ProjectBuilder subclass per registered project
+│   │       ├── __init__.py
+│   │       └── trees.py            # TreeProjectBuilder — composer for tree-app (schemas+rules+governance)
+│   │
+│   ├── scoring/                    # Domain layer — pure scoring rules only (no registry knowledge)
 │   │   ├── __init__.py
-│   │   ├── registry.py             # Maps project_id → PayloadSchema + list of ScoringRule instances
 │   │   ├── base.py                 # Abstract base: ScoringRule protocol / ABC
 │   │   ├── pipeline.py             # ScoringPipeline — iterates rules, aggregates weighted scores
 │   │   ├── common/                 # Generic scoring rules reusable across all projects
@@ -188,12 +196,29 @@ The scoring pipeline (Stages 1 → 2 → 4-input) runs synchronously on submissi
 | **Key files** | `scoring_service.py` — resolves the project config from the registry, validates the raw payload against the project-specific Pydantic schema (Stage 1), then passes the validated object to the `ScoringPipeline` (Stage 2 + Stage 4 input). After scoring, invokes the governance policy to compute `required_validations`. On finalization, delegates to the Trust Advisor to compute the `trust_adjustment` delta (Stage 4 output). `governance_service.py` — queries eligible tasks for a given trust level using the project's governance policy. |
 | **Rule** | May depend on `scoring/`, `governance/`, `models/`, `schemas/`; must **not** depend on `api/`. |
 
+### `app/registry/` — Registry Domain (Project Composer)
+
+| Concern | Detail |
+|---|---|
+| **Role** | The single top-level domain that wires together schemas, scoring rules, and governance policies for each registered project. Decoupled from all three sub-domains it composes. |
+| **Contains** | `ProjectRegistryEntry` dataclass, `_Registry` singleton, `ProjectBuilder` ABC, and one concrete `ProjectBuilder` per project under `projects/`. |
+| **Key abstraction** | `ProjectBuilder` (Open/Closed): adding a new project means creating a new subclass in `registry/projects/` and registering it in `bootstrap.py` — no existing code changes. |
+| **Rule** | No HTTP, no DB imports. The registry is populated at startup by `bootstrap.py` and consumed by services via dependency injection. |
+
+### `app/bootstrap.py` — Startup Bootstrap
+
+| Concern | Detail |
+|---|---|
+| **Role** | Initializes the registry singleton and loads all active `ProjectBuilder` instances at application startup. |
+| **Usage** | Called once from the FastAPI `lifespan` handler in `main.py`. Auto-executes on import so tests work without an explicit call. |
+| **Rule** | Adding a new project = import its `ProjectBuilder` here and call `registry.load(MyProjectBuilder())`. |
+
 ### `app/scoring/` — Domain Layer (Scoring Core)
 
 | Concern | Detail |
 |---|---|
 | **Role** | Houses all **scoring rules** (the "strategies") and the pipeline that runs them. This is the Confidence Score engine. |
-| **Contains** | An abstract `ScoringRule` base, a `registry` that maps projects to their payload schema + rule sets + governance policy, the `ScoringPipeline`, and concrete rule implementations. |
+| **Contains** | An abstract `ScoringRule` base, the `ScoringPipeline`, and concrete rule implementations. The registry has been extracted to `app/registry/`. |
 | **Sub-folders** | `common/` for reusable scoring factors (e.g., `trust_level.py` for Tₙ input, `trust_advisor.py` for Stage 4 advisory output), `projects/<name>/` for domain-specific scoring rules. |
 | **Rule** | Pure logic — no HTTP, no DB imports. Rules receive **validated** data (Pydantic model instances that already passed Stage 1) and return score components. |
 | **Not here** | Completeness checks, range checks, type validation — these belong in `app/schemas/projects/` as Pydantic `Field` constraints (Stage 1). Governance decisions belong in `app/governance/`. |

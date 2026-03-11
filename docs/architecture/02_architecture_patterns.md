@@ -12,7 +12,9 @@
 |---|---|---|
 | **Strategy Pattern** | `app/scoring/` | Swap scoring rules per project without changing the pipeline. |
 | **Envelope Pattern** | `app/schemas/envelope.py` | Separate stable metadata from variable domain payloads. |
-| **Registry Pattern** | `app/scoring/registry.py` | Dynamically resolve which Pydantic schema (Stage 1), scoring strategies (Stage 2 + 4), and governance policy apply to a given `project_id`. |
+| **Registry Pattern** | `app/registry/` | Dynamically resolve which Pydantic schema (Stage 1), scoring strategies (Stage 2 + 4), and governance policy apply to a given `project_id`. |
+| **Builder Pattern** | `app/registry/base.py` + `app/registry/projects/` | `ProjectBuilder` ABC defines a standard interface for composing a `ProjectRegistryEntry`. Each project implements its own builder — no registry code changes when a new project is added. |
+| **Bootstrap Pattern** | `app/bootstrap.py` | Single startup entry point that instantiates all active `ProjectBuilder`s and loads them into the registry. Ensures the registry is ready before any request is served. |
 | **Trust Advisor Pattern** | `app/scoring/common/trust_advisor.py` | Winnow advises, the client decides. Computes per-submission `trust_adjustment` deltas based on ground-truth finalization signals. |
 | **Task Orchestration Pattern** | `app/governance/` + `app/services/governance_service.py` | Winnow is the **Governance Authority**: it determines review requirements (Target State) per submission and controls which tasks are available to which reviewers. Client projects act as Task Clients. |
 | **Repository Pattern** | `app/services/` + `app/models/` | Abstract database access behind service functions so domain logic stays DB-free. |
@@ -100,7 +102,7 @@ To add a scoring rule for a new project (e.g., a biodiversity observation app):
 
 1. Create `app/scoring/projects/biodiversity/observation_plausibility.py`.
 2. Implement `ScoringRule.evaluate(...)`.
-3. Register it in the project's rule set inside the registry.
+3. Register it in the project's `ProjectBuilder.build()` method (e.g., `app/registry/projects/biodiversity.py`).
 
 **No existing code needs to change.** This is the [Open/Closed Principle](https://en.wikipedia.org/wiki/Open%E2%80%93closed_principle) in action.
 
@@ -129,7 +131,20 @@ The envelope's `metadata` and `user_context` sections are **always** validated b
 
 ## 3. Registry Pattern — Project-to-Rules Mapping
 
-The registry is a central lookup that, given a `project_id`, returns:
+### Structure
+
+The registry domain lives in `app/registry/` and is composed of three layers:
+
+| Module | Responsibility |
+|---|---|
+| `manager.py` | `_Registry` singleton + `ProjectRegistryEntry` dataclass. Value-agnostic — stores whatever a builder hands it. |
+| `base.py` | `ProjectBuilder` ABC — declares `project_id` property and `build() → ProjectRegistryEntry` method. |
+| `projects/<name>.py` | Concrete builder per project — the single authoritative source for all project-specific numeric config. |
+| `app/bootstrap.py` | Instantiates builders and calls `registry.load(builder)` at startup. |
+
+### What the Registry Provides
+
+Given a `project_id`, the registry returns a `ProjectRegistryEntry` containing:
 
 1. The **Pydantic schema class** to validate the raw payload against (Stage 1).
 2. The **ordered list of `ScoringRule` instances** (with their configured weights) to run (Stage 2 + Stage 4 input).
