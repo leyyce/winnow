@@ -6,62 +6,18 @@ Tests for common scoring components:
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from uuid import uuid4
 
 import pytest
 
-from app.schemas.envelope import UserContext
-from app.schemas.projects.trees import (
-    SpeciesStats,
-    TreeMeasurementPayload,
-    TreePayload,
-    TreePhotoPayload,
-)
+from app.schemas.projects.trees import TreePayload
 from app.scoring.common.trust_advisor import (
     TrustAdvisor,
     TrustAdvisorConfig,
-    UserSubmissionStats,
 )
 from app.scoring.common.trust_level import TrustLevelRule
 from app.registry.manager import registry
-
-
-# ── Shared helpers ────────────────────────────────────────────────────────────
-
-def _ctx(trust_level: int = 50) -> UserContext:
-    return UserContext(
-        user_id=uuid4(),
-        username="tester",
-        role="citizen",
-        trust_level=trust_level,
-        total_submissions=10,
-        account_created_at=datetime(2023, 1, 1, tzinfo=timezone.utc),
-    )
-
-
-def _payload() -> TreePayload:
-    return TreePayload(
-        tree_id=uuid4(),
-        species_id=uuid4(),
-        measurement=TreeMeasurementPayload(height=15.0, inclination=5, trunk_diameter=30),
-        photos=[TreePhotoPayload(path="a.jpg"), TreePhotoPayload(path="b.jpg")],
-        step_length_measured=True,
-        species_stats=SpeciesStats(
-            mean_height=18.0, std_height=4.0,
-            mean_inclination=6.0, std_inclination=3.0,
-            mean_trunk_diameter=28.0, std_trunk_diameter=8.0,
-        ),
-    )
-
-
-def _stats(consecutive: int = 0) -> UserSubmissionStats:
-    return UserSubmissionStats(
-        total_finalized=10,
-        total_approved=8,
-        total_rejected=2,
-        consecutive_approvals=consecutive,
-    )
+from app.tests.conftest import _ctx, _payload, _user_stats
 
 
 # ── TrustLevelRule ────────────────────────────────────────────────────────────
@@ -139,44 +95,44 @@ class TestTrustAdvisor:
         self.user_id = uuid4()
 
     def test_approval_gives_positive_delta(self):
-        result = self.advisor.compute_adjustment(self.user_id, 20, "approved", _stats())
+        result = self.advisor.compute_adjustment(self.user_id, 20, "approved", _user_stats())
         assert result.recommended_delta == 1
 
     def test_rejection_gives_negative_delta(self):
-        result = self.advisor.compute_adjustment(self.user_id, 20, "rejected", _stats())
+        result = self.advisor.compute_adjustment(self.user_id, 20, "rejected", _user_stats())
         assert result.recommended_delta == -3
 
     def test_streak_bonus_applied_at_threshold(self):
-        result = self.advisor.compute_adjustment(self.user_id, 20, "approved", _stats(consecutive=5))
+        result = self.advisor.compute_adjustment(self.user_id, 20, "approved", _user_stats(consecutive=5))
         assert result.recommended_delta == 1 + 2
 
     def test_streak_bonus_applied_above_threshold(self):
-        result = self.advisor.compute_adjustment(self.user_id, 20, "approved", _stats(consecutive=10))
+        result = self.advisor.compute_adjustment(self.user_id, 20, "approved", _user_stats(consecutive=10))
         assert result.recommended_delta == 1 + 2
 
     def test_streak_bonus_not_applied_below_threshold(self):
-        result = self.advisor.compute_adjustment(self.user_id, 20, "approved", _stats(consecutive=4))
+        result = self.advisor.compute_adjustment(self.user_id, 20, "approved", _user_stats(consecutive=4))
         assert result.recommended_delta == 1
 
     def test_project_bounds_returned(self):
-        result = self.advisor.compute_adjustment(self.user_id, 20, "approved", _stats())
+        result = self.advisor.compute_adjustment(self.user_id, 20, "approved", _user_stats())
         assert result.project_min_trust == 0
         assert result.project_max_trust == 100
 
-    def test_unknown_status_zero_delta(self):
-        result = self.advisor.compute_adjustment(self.user_id, 20, "pending", _stats())
-        assert result.recommended_delta == 0
+    def test_unknown_status_raises_value_error(self):
+        with pytest.raises(ValueError, match="Unknown final_status"):
+            self.advisor.compute_adjustment(self.user_id, 20, "pending", _user_stats())
 
     def test_current_trust_level_echoed(self):
-        result = self.advisor.compute_adjustment(self.user_id, 42, "approved", _stats())
+        result = self.advisor.compute_adjustment(self.user_id, 42, "approved", _user_stats())
         assert result.current_trust_level == 42
 
     def test_user_id_echoed(self):
-        result = self.advisor.compute_adjustment(self.user_id, 20, "approved", _stats())
+        result = self.advisor.compute_adjustment(self.user_id, 20, "approved", _user_stats())
         assert result.user_id == self.user_id
 
     def test_reason_contains_streak_info(self):
-        result = self.advisor.compute_adjustment(self.user_id, 20, "approved", _stats(consecutive=5))
+        result = self.advisor.compute_adjustment(self.user_id, 20, "approved", _user_stats(consecutive=5))
         assert "streak" in result.reason.lower() or "consecutive" in result.reason.lower()
 
 
@@ -200,17 +156,17 @@ class TestScoringRegistry:
 
     def test_tree_app_has_pipeline_with_five_rules(self):
         entry = registry.get_config("tree-app")
-        assert len(entry.pipeline._rules) == 5
+        assert len(entry.pipeline.rules) == 5
 
     def test_tree_app_pipeline_rule_names(self):
         entry = registry.get_config("tree-app")
-        names = {r.name for r in entry.pipeline._rules}
+        names = {r.name for r in entry.pipeline.rules}
         assert names == {"height_factor", "distance_factor", "trust_level",
                          "comment_factor", "plausibility_factor"}
 
     def test_tree_app_weights_sum_to_one(self):
         entry = registry.get_config("tree-app")
-        total = sum(r.weight for r in entry.pipeline._rules)
+        total = sum(r.weight for r in entry.pipeline.rules)
         assert total == pytest.approx(1.0)
 
     def test_tree_app_thresholds_present(self):

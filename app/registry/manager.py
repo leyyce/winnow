@@ -13,6 +13,23 @@ Design notes
 * Configuration source: code-based for the prototype (see
   02_architecture_patterns.md §3). A DB-backed approach can be added later
   without changing this module — only the builders change.
+
+Architectural Trade-off — Pragmatic Domain Imports (W2)
+--------------------------------------------------------
+``ProjectRegistryEntry`` imports concrete types from the scoring and governance
+layers (``ScoringPipeline``, ``TrustAdvisor``, ``GovernancePolicy``).
+Architecturally the registry should be fully domain-agnostic; however,
+removing these imports would require replacing the typed dataclass fields with
+``Any``, destroying IDE type-hinting and auto-complete for every service and
+test that consumes ``ProjectRegistryEntry``.
+
+Decision: accept this pragmatic trade-off.
+* Only **abstract base types / concrete infrastructure classes** are imported —
+  never project-specific rule implementations.
+* The registry never inspects or calls any domain logic; it is a typed
+  container only.
+* This decision is documented here and in
+  ``docs/architecture/02_architecture_patterns.md`` §3.
 """
 from __future__ import annotations
 

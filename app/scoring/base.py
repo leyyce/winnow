@@ -26,10 +26,15 @@ P = TypeVar("P", bound=BaseModel)
 @dataclass(frozen=True)
 class RuleResult:
     """Normalised output of a single scoring rule evaluation."""
-
     rule_name: str
     score: float        # normalised ∈ [0.0, 1.0]
     details: str | None = None
+
+    def __post_init__(self) -> None:
+        if not (0.0 <= self.score <= 1.0):
+            raise ValueError(
+                f"RuleResult.score must be in [0.0, 1.0], got {self.score!r}"
+            )
 
 
 class ScoringRule(ABC, Generic[P]):

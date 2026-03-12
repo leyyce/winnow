@@ -10,31 +10,13 @@ Covers edge cases not exercised by the integration tests in test_tree_rules.py:
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from uuid import uuid4
-
 import pytest
 from pydantic import BaseModel
 
 from app.schemas.envelope import UserContext
 from app.scoring.base import RuleResult, ScoringRule
 from app.scoring.pipeline import PipelineResult, ScoringPipeline
-
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-_NOW = datetime(2024, 1, 1, tzinfo=timezone.utc)
-
-
-def _ctx() -> UserContext:
-    return UserContext(
-        user_id=uuid4(),
-        username="tester",
-        role="citizen",
-        trust_level=50,
-        total_submissions=5,
-        account_created_at=_NOW,
-    )
+from app.tests.conftest import _ctx
 
 
 class DummyPayload(BaseModel):
@@ -96,6 +78,22 @@ class TestRuleResult:
         rr = RuleResult(rule_name="r", score=0.5)
         with pytest.raises(Exception):  # dataclass(frozen=True) raises FrozenInstanceError
             setattr(rr, "score", 0.9)
+
+    def test_score_above_one_raises(self):
+        with pytest.raises(ValueError, match="must be in"):
+            RuleResult(rule_name="r", score=1.001)
+
+    def test_score_below_zero_raises(self):
+        with pytest.raises(ValueError, match="must be in"):
+            RuleResult(rule_name="r", score=-0.001)
+
+    def test_score_at_zero_accepted(self):
+        rr = RuleResult(rule_name="r", score=0.0)
+        assert rr.score == 0.0
+
+    def test_score_at_one_accepted(self):
+        rr = RuleResult(rule_name="r", score=1.0)
+        assert rr.score == 1.0
 
 
 # ── ScoringPipeline — empty ────────────────────────────────────────────────────
@@ -261,6 +259,14 @@ class TestPipelineWeightValidation:
             FixedRule("r3", weight=0.7, fixed_score=1.0),
         ])
         assert pipeline.run(DummyPayload(), _ctx()).total_score == pytest.approx(100.0)
+
+    def test_individual_weight_above_one_raises(self):
+        with pytest.raises(ValueError, match="out of bounds"):
+            ScoringPipeline([FixedRule("r", weight=1.5, fixed_score=1.0)])
+
+    def test_individual_weight_below_zero_raises(self):
+        with pytest.raises(ValueError, match="out of bounds"):
+            ScoringPipeline([FixedRule("r", weight=-0.1, fixed_score=1.0)])
 
 
 # ── ScoringPipeline — payload and context pass-through ────────────────────────

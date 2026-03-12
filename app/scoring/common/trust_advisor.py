@@ -105,8 +105,10 @@ class TrustAdvisor:
             delta = -cfg.penalty_per_rejection
             reason = "Submission rejected"
         else:
-            delta = 0
-            reason = f"Unknown final status '{final_status}'; no adjustment applied"
+            raise ValueError(
+                f"Unknown final_status '{final_status}'; "
+                f"expected 'approved' or 'rejected'"
+            )
 
         return TrustAdjustment(
             user_id=user_id,

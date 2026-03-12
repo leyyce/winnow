@@ -87,11 +87,10 @@ classDiagram
     ScoringRule ..> RuleResult : returns
 
     class ScoringPipeline {
-        +rules: list~ScoringRule~
+        +rules: tuple~ScoringRule~ <<property, read-only>>
         +run(payload: BaseModel, context: UserContext) ScoringResult
     }
-
-    note for ScoringPipeline "Validates sum(weights) == 1.0 at\nconstruction time (math.isclose, tol=1e-6).\nRaises ValueError if misconfigured."
+    note for ScoringPipeline "Validates sum(weights) == 1.0 at\nconstruction time (math.isclose, tol=1e-6).\nAlso validates each individual weight ∈ [0,1].\nRaises ValueError if misconfigured."
 
     ScoringPipeline o-- ScoringRule : iterates over
 ```
@@ -106,7 +105,7 @@ classDiagram
 
 1. **`evaluate(payload, context)` — the public entry point (base class, do not override).** It verifies that `isinstance(payload, self.payload_type)` and raises a `TypeError` if the wrong payload type is passed. It then delegates to `_evaluate()`. This centralises runtime type safety across all rules, eliminating the need for per-rule `assert isinstance` guards.
 2. **`_evaluate(payload: P, context)` — the abstract hook (subclass responsibility).** Receives a payload already confirmed to be of type `P` and returns a `RuleResult`. The payload is a **validated Pydantic model instance** (e.g., `TreePayload`), not a raw dict — Stage 1 validation is guaranteed to have run first.
-3. `RuleResult` contains a normalised `score ∈ [0, 1]` and an optional human-readable `details` string.
+3. `RuleResult` contains a normalised `score ∈ [0, 1]` and an optional human-readable `details` string. The `score` is validated at instantiation via `__post_init__` — a value outside `[0.0, 1.0]` raises `ValueError` immediately, preventing malformed results from propagating.
 4. The `ScoringPipeline` collects all `RuleResult` objects, multiplies each by its `weight`, sums them, and produces the final **Confidence Score (CS)**. The pipeline verifies `∑weights = 1.0` at construction time (see [Strict Weight Validation](#strict-weight-validation) below).
 
 ### Adding a New Rule
@@ -123,11 +122,12 @@ To add a scoring rule for a new project (e.g., a biodiversity observation app):
 
 ### Strict Weight Validation
 
-The `ScoringPipeline` enforces a critical mathematical invariant at construction time:
+The `ScoringPipeline` enforces two mathematical invariants at construction time:
 
-$$\sum_{i} w_i = 1.0$$
+1. **Individual bounds** — every rule weight must satisfy `0.0 ≤ wᵢ ≤ 1.0`. A `ValueError` is raised for the first out-of-bounds weight found.
+2. **Sum constraint** — the weights must satisfy $\sum_{i} w_i = 1.0$ (checked with `math.isclose`, tolerance `1e-6`). Raises `ValueError` if violated.
 
-If the weights of the provided rules do not sum to `1.0` (checked with `math.isclose`, tolerance `1e-6`), the pipeline raises a `ValueError` immediately — before any submission is processed. This guarantees that the Confidence Score is always a true weighted average and can never silently exceed 100 due to misconfiguration in a `ProjectBuilder`. Empty pipelines (zero rules) are exempt from this check.
+Both checks run at construction time, before any submission is processed. A misconfigured `ProjectBuilder` is caught at bootstrap, never silently at runtime. Empty pipelines (zero rules) are exempt from both checks.
 
 ---
 
@@ -160,7 +160,7 @@ The registry domain lives in `app/registry/` and is composed of three layers:
 
 | Module | Responsibility |
 |---|---|
-| `manager.py` | `_Registry` singleton + `ProjectRegistryEntry` dataclass. Value-agnostic — stores whatever a builder hands it. |
+| `manager.py` | `_Registry` singleton + `ProjectRegistryEntry` dataclass. Value-agnostic — stores whatever a builder hands it. See [Pragmatic Domain Imports](#pragmatic-domain-imports-w2-trade-off) note below. |
 | `base.py` | `ProjectBuilder` ABC — declares `project_id` property and `build() → ProjectRegistryEntry` method. |
 | `projects/<name>.py` | Concrete builder per project — the single authoritative source for all project-specific numeric config. |
 | `app/bootstrap.py` | Auto-discovers every concrete `ProjectBuilder` in `app.registry.projects` via `pkgutil`/`importlib`/`inspect` and calls `registry.load(builder)` for each. Adding a new project file is sufficient — `bootstrap.py` never needs to be edited. |
@@ -269,6 +269,15 @@ async def finalize_submission(submission_id: UUID, final_status: str) -> Finaliz
 > The `validated_payload` passed to `pipeline.run()` is a typed Pydantic model (e.g., `TreePayload`), not a `dict`. This means scoring rules can access fields with type safety (e.g., `payload.measurement.height`) instead of doing error-prone dict lookups.
 >
 > The `required_validations` returned by the governance policy tells the client exactly who must review this submission (Target State). This is Winnow acting as the **Governance Authority** — the client (Laravel) renders whatever Winnow permits.
+
+### Pragmatic Domain Imports (W2 trade-off)
+
+`ProjectRegistryEntry` in `manager.py` imports concrete types from the scoring and governance layers (`ScoringPipeline`, `TrustAdvisor`, `GovernancePolicy`). Architecturally the registry should be fully domain-agnostic; however, replacing these typed fields with `Any` would destroy IDE type-hinting and auto-complete for every service and test that consumes `ProjectRegistryEntry`.
+
+**Decision:** accept this as a pragmatic trade-off.
+- Only **abstract base types / infrastructure classes** are imported — never project-specific rule implementations.
+- The registry never inspects or invokes domain logic; it is a typed container only.
+- This decision is documented in the `manager.py` module docstring and here.
 
 ### Configuration Source
 
@@ -602,6 +611,7 @@ The **Trust Advisor** is a dedicated component (not a `ScoringRule`) that encaps
 | **Ground-truth only** | Recommendations are computed from finalized outcomes (expert/community verdicts), never from preliminary scores. |
 | **No user table in Winnow** | The Advisor derives user reliability metrics (approval rate, streak length, total finalized submissions) from Winnow's own `submissions` table. No synchronized `users` table is needed. |
 | **Configurable per project** | Reward/penalty rules (e.g., "+2 for 5 consecutive approvals", "−3 for a rejection") are part of the project's registry configuration. |
+| **Fail-fast on unknown status** | `compute_adjustment` raises `ValueError` if `final_status` is neither `"approved"` nor `"rejected"`. This prevents silent no-ops that could mask client-side integration bugs. |
 
 ### Conceptual Interface
 

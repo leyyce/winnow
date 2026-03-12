@@ -10,19 +10,10 @@ Tests for tree-project scoring components:
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from uuid import uuid4
-
 import pytest
 
 from app.governance.projects.trees import GovernanceTier, TreeGovernancePolicy
-from app.schemas.envelope import UserContext
-from app.schemas.projects.trees import (
-    SpeciesStats,
-    TreeMeasurementPayload,
-    TreePayload,
-    TreePhotoPayload,
-)
+from app.schemas.projects.trees import SpeciesStats, TreePhotoPayload
 from app.schemas.results import RequiredValidations
 from app.registry.manager import registry
 from app.scoring.pipeline import ScoringPipeline
@@ -30,53 +21,7 @@ from app.scoring.projects.trees.comment_factor import CommentFactorRule
 from app.scoring.projects.trees.distance_factor import DistanceFactorRule
 from app.scoring.projects.trees.height_factor import HeightFactorRule
 from app.scoring.projects.trees.plausibility_factor import PlausibilityFactorRule
-
-
-# ── Shared helpers ────────────────────────────────────────────────────────────
-
-def _ctx(trust_level: int = 50) -> UserContext:
-    return UserContext(
-        user_id=uuid4(),
-        username="tester",
-        role="citizen",
-        trust_level=trust_level,
-        total_submissions=5,
-        account_created_at=datetime(2023, 1, 1, tzinfo=timezone.utc),
-    )
-
-
-def _default_stats() -> SpeciesStats:
-    return SpeciesStats(
-        mean_height=20.0, std_height=5.0,
-        mean_inclination=5.0, std_inclination=2.0,
-        mean_trunk_diameter=30.0, std_trunk_diameter=10.0,
-    )
-
-
-def _payload(
-    height: float = 20.0,
-    inclination: int = 5,
-    trunk_diameter: int = 30,
-    note: str | None = None,
-    step_length_measured: bool = True,
-    photos: list[TreePhotoPayload] | None = None,
-    species_stats: SpeciesStats | None = None,
-) -> TreePayload:
-    if photos is None:
-        photos = [TreePhotoPayload(path="a.jpg"), TreePhotoPayload(path="b.jpg")]
-    return TreePayload(
-        tree_id=uuid4(),
-        species_id=uuid4(),
-        measurement=TreeMeasurementPayload(
-            height=height,
-            inclination=inclination,
-            trunk_diameter=trunk_diameter,
-            note=note,
-        ),
-        photos=photos,
-        step_length_measured=step_length_measured,
-        species_stats=species_stats or _default_stats(),
-    )
+from app.tests.conftest import _ctx, _default_stats, _payload
 
 
 # ── TreePayload Stage 1 Validation ────────────────────────────────────────────

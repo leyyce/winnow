@@ -107,11 +107,11 @@ class TestTreeProjectBuilder:
 
     def test_pipeline_has_five_rules(self):
         entry = self.builder.build()
-        assert len(entry.pipeline._rules) == 5
+        assert len(entry.pipeline.rules) == 5
 
     def test_pipeline_weights_sum_to_one(self):
         entry = self.builder.build()
-        total = sum(r.weight for r in entry.pipeline._rules)
+        total = sum(r.weight for r in entry.pipeline.rules)
         assert total == pytest.approx(1.0)
 
     def test_trust_advisor_is_trust_advisor(self):
@@ -141,8 +141,8 @@ class TestTreeProjectBuilder:
         entry_b = self.builder.build()
         assert entry_a.payload_schema is entry_b.payload_schema
         assert entry_a.thresholds.approve == entry_b.thresholds.approve
-        rule_names_a = {r.name for r in entry_a.pipeline._rules}
-        rule_names_b = {r.name for r in entry_b.pipeline._rules}
+        rule_names_a = {r.name for r in entry_a.pipeline.rules}
+        rule_names_b = {r.name for r in entry_b.pipeline.rules}
         assert rule_names_a == rule_names_b
 
 
