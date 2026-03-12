@@ -12,11 +12,10 @@ two-phase lifecycle: initial scoring vs. ground-truth finalization.
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, Field, model_validator
 
 
 class RuleBreakdown(BaseModel):
@@ -50,41 +49,57 @@ class ThresholdConfig(BaseModel):
     """
     Per-project Confidence Score thresholds returned alongside every result.
 
-    These are advisory values — the client uses them to route the submission
-    (auto-approve / queue for review / auto-reject) without hard-coding thresholds
-    on its own side. Winnow advises; the client decides.
+    These are advisory values — the client uses them to route a submission into
+    one of three contiguous regions on the 0-100 Confidence Score scale:
 
-    Cross-field constraint: ``approve >= review >= reject``.
+      ┌─────────────────────────────────────────────────────────┐
+      │  [0 … manual_review_min)  →  auto-reject  (implicit)   │
+      │  [manual_review_min … auto_approve_min)  →  review      │
+      │  [auto_approve_min … 100]  →  auto-approve              │
+      └─────────────────────────────────────────────────────────┘
+
+    **Why 2 boundaries instead of 3?**
+    A 0-100 integer scale divided into 3 contiguous, non-overlapping regions
+    requires exactly 2 boundary values.  A 3-value system (approve / review /
+    reject) allows *gaps* (scores between reject and review that fall into no
+    region) and *overlaps* (approve == reject), both of which produce ambiguous
+    routing decisions.  Two boundaries are mathematically sufficient and
+    eliminate that class of misconfiguration entirely.
+
+    The ``reject`` region is implicit: any score below ``manual_review_min``
+    is auto-rejected by the client.  Winnow does not return a third field
+    because it would be redundant (``reject_max = manual_review_min - 1``) and
+    could create the illusion that a gap between review and reject is
+    permissible.
+
+    Cross-field constraint: ``auto_approve_min >= manual_review_min``.
     """
 
-    approve: float = Field(
-        ge=0.0,
-        le=100.0,
-        description="Scores at or above this value may be auto-approved by the client.",
+    auto_approve_min: int = Field(
+        ge=0,
+        le=100,
+        description=(
+            "Scores at or above this value may be auto-approved by the client. "
+            "Integer on the 0-100 Confidence Score scale."
+        ),
     )
-    review: float = Field(
-        ge=0.0,
-        le=100.0,
-        description="Scores at or above this value (but below `approve`) require manual review.",
-    )
-    reject: float = Field(
-        ge=0.0,
-        le=100.0,
-        description="Scores below this value may be auto-rejected by the client.",
+    manual_review_min: int = Field(
+        ge=0,
+        le=100,
+        description=(
+            "Scores at or above this value (but below `auto_approve_min`) are queued "
+            "for manual review.  Scores below this value are implicitly auto-rejected "
+            "by the client — no third field is returned."
+        ),
     )
 
     @model_validator(mode="after")
     def _thresholds_ordered(self) -> "ThresholdConfig":
-        """Enforce approve >= review >= reject to prevent nonsensical routing."""
-        if self.approve < self.review:
+        """Enforce auto_approve_min >= manual_review_min to prevent routing gaps."""
+        if self.auto_approve_min < self.manual_review_min:
             raise ValueError(
-                f"'approve' threshold ({self.approve}) must be >= "
-                f"'review' threshold ({self.review})"
-            )
-        if self.review < self.reject:
-            raise ValueError(
-                f"'review' threshold ({self.review}) must be >= "
-                f"'reject' threshold ({self.reject})"
+                f"'auto_approve_min' ({self.auto_approve_min}) must be >= "
+                f"'manual_review_min' ({self.manual_review_min})"
             )
         return self
 
@@ -153,6 +168,6 @@ class ScoringResultResponse(BaseModel):
     thresholds: ThresholdConfig = Field(
         description="Project-specific score thresholds for client-side routing decisions.",
     )
-    created_at: datetime = Field(
+    created_at: AwareDatetime = Field(
         description="ISO-8601 timestamp of when Winnow persisted this scoring result.",
     )

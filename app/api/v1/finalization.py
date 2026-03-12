@@ -32,7 +32,7 @@ router = APIRouter(tags=["submissions"])
     description=(
         "Closes the feedback loop by delivering the expert/community decision. "
         "Computes a trust adjustment recommendation (Stage 4 output). "
-        "Returns 501 until the DB persistence layer is implemented."
+        "Requires the DB persistence layer (Phase 2)."
     ),
 )
 async def finalize_submission(

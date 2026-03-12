@@ -49,7 +49,7 @@ def _user_context(**overrides) -> dict:
 
 
 def _thresholds(**overrides) -> dict:
-    base = dict(approve=80.0, review=50.0, reject=20.0)
+    base = dict(auto_approve_min=80, manual_review_min=50)
     base.update(overrides)
     return base
 
@@ -241,34 +241,44 @@ class TestRuleBreakdown:
 class TestThresholdConfig:
     def test_valid_construction(self):
         tc = ThresholdConfig.model_validate(_thresholds())
-        assert tc.approve == 80.0
-        assert tc.review == 50.0
-        assert tc.reject == 20.0
+        assert tc.auto_approve_min == 80
+        assert tc.manual_review_min == 50
 
-    def test_approve_above_100_rejected(self):
-        with pytest.raises(ValidationError, match="approve"):
-            ThresholdConfig.model_validate(_thresholds(approve=100.1))
+    def test_auto_approve_min_above_100_rejected(self):
+        with pytest.raises(ValidationError, match="auto_approve_min"):
+            ThresholdConfig.model_validate(_thresholds(auto_approve_min=101))
 
-    def test_review_below_zero_rejected(self):
-        with pytest.raises(ValidationError, match="review"):
-            ThresholdConfig.model_validate(_thresholds(review=-1.0))
+    def test_manual_review_min_below_zero_rejected(self):
+        with pytest.raises(ValidationError, match="manual_review_min"):
+            ThresholdConfig.model_validate(_thresholds(manual_review_min=-1))
 
     def test_boundary_values_accepted(self):
-        tc = ThresholdConfig.model_validate(dict(approve=100.0, review=0.0, reject=0.0))
-        assert tc.approve == 100.0
+        tc = ThresholdConfig.model_validate(dict(auto_approve_min=100, manual_review_min=0))
+        assert tc.auto_approve_min == 100
+        assert tc.manual_review_min == 0
 
-    def test_approve_below_review_raises(self):
-        with pytest.raises(ValidationError, match="'approve' threshold"):
-            ThresholdConfig.model_validate(dict(approve=40.0, review=50.0, reject=20.0))
-
-    def test_review_below_reject_raises(self):
-        with pytest.raises(ValidationError, match="'review' threshold"):
-            ThresholdConfig.model_validate(dict(approve=80.0, review=30.0, reject=50.0))
+    def test_auto_approve_below_manual_review_raises(self):
+        with pytest.raises(ValidationError, match="'auto_approve_min'"):
+            ThresholdConfig.model_validate(dict(auto_approve_min=40, manual_review_min=50))
 
     def test_equal_thresholds_accepted(self):
-        # approve == review == reject is a degenerate but logically valid config
-        tc = ThresholdConfig.model_validate(dict(approve=50.0, review=50.0, reject=50.0))
-        assert tc.approve == tc.review == tc.reject == 50.0
+        # auto_approve_min == manual_review_min collapses the review band to zero width;
+        # degenerate but logically valid — all submissions either auto-approve or auto-reject.
+        tc = ThresholdConfig.model_validate(dict(auto_approve_min=50, manual_review_min=50))
+        assert tc.auto_approve_min == tc.manual_review_min == 50
+
+    def test_integer_types_enforced(self):
+        # Floats that are whole numbers are coerced to int by Pydantic
+        tc = ThresholdConfig.model_validate(dict(auto_approve_min=80.0, manual_review_min=50.0))
+        assert isinstance(tc.auto_approve_min, int)
+        assert isinstance(tc.manual_review_min, int)
+
+    def test_no_old_three_field_shape(self):
+        # The old approve/review/reject shape must not exist — only 2 boundaries are returned
+        tc = ThresholdConfig.model_validate(_thresholds())
+        assert not hasattr(tc, "approve")
+        assert not hasattr(tc, "review")
+        assert not hasattr(tc, "reject")
 
 
 # ── RequiredValidations ────────────────────────────────────────────────────────

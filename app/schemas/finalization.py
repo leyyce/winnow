@@ -12,11 +12,10 @@ References
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import AwareDatetime, BaseModel, Field
 
 
 class FinalizationRequest(BaseModel):
@@ -97,6 +96,6 @@ class FinalizationResponse(BaseModel):
     trust_adjustment: TrustAdjustment = Field(
         description="Advisory trust delta for the client to apply to the submitter's trust level.",
     )
-    finalized_at: datetime = Field(
+    finalized_at: AwareDatetime = Field(
         description="ISO-8601 timestamp of when Winnow processed the finalization.",
     )

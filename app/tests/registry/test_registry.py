@@ -10,7 +10,8 @@ from __future__ import annotations
 import pytest
 
 from app.registry.base import ProjectBuilder
-from app.registry.manager import ProjectRegistryEntry, _Registry, registry
+from app.registry.manager import ProjectRegistryEntry, Registry, registry
+from app.core.exceptions import ProjectNotFoundError
 from app.registry.projects.trees import TreeProjectBuilder
 from app.schemas.projects.trees import TreePayload
 from app.scoring.common.trust_advisor import TrustAdvisor
@@ -122,25 +123,27 @@ class TestTreeProjectBuilder:
         entry = self.builder.build()
         assert isinstance(entry.governance_policy, TreeGovernancePolicy)
 
-    def test_thresholds_approve_above_review(self):
+    def test_thresholds_auto_approve_above_manual_review(self):
         entry = self.builder.build()
-        assert entry.thresholds.approve > entry.thresholds.review
-
-    def test_thresholds_review_at_or_above_reject(self):
-        entry = self.builder.build()
-        assert entry.thresholds.review >= entry.thresholds.reject
+        assert entry.thresholds.auto_approve_min >= entry.thresholds.manual_review_min
 
     def test_thresholds_within_valid_range(self):
         entry = self.builder.build()
-        for value in (entry.thresholds.approve, entry.thresholds.review, entry.thresholds.reject):
-            assert 0.0 <= value <= 100.0
+        for value in (entry.thresholds.auto_approve_min, entry.thresholds.manual_review_min):
+            assert 0 <= value <= 100
+
+    def test_thresholds_are_integers(self):
+        entry = self.builder.build()
+        assert isinstance(entry.thresholds.auto_approve_min, int)
+        assert isinstance(entry.thresholds.manual_review_min, int)
 
     def test_build_is_deterministic(self):
         # Two calls must produce entries with identical configuration.
         entry_a = self.builder.build()
         entry_b = self.builder.build()
         assert entry_a.payload_schema is entry_b.payload_schema
-        assert entry_a.thresholds.approve == entry_b.thresholds.approve
+        assert entry_a.thresholds.auto_approve_min == entry_b.thresholds.auto_approve_min
+        assert entry_a.thresholds.manual_review_min == entry_b.thresholds.manual_review_min
         rule_names_a = {r.name for r in entry_a.pipeline.rules}
         rule_names_b = {r.name for r in entry_b.pipeline.rules}
         assert rule_names_a == rule_names_b
@@ -151,7 +154,7 @@ class TestTreeProjectBuilder:
 class TestRegistry:
     def setup_method(self):
         # Use a fresh isolated registry for unit tests to avoid side effects.
-        self.reg = _Registry()
+        self.reg = Registry()
 
     def test_empty_registry_has_no_projects(self):
         assert self.reg.registered_projects == []
@@ -165,16 +168,15 @@ class TestRegistry:
         entry = self.reg.get_config("tree-app")
         assert isinstance(entry, ProjectRegistryEntry)
 
-    def test_get_config_unknown_project_raises_key_error(self):
-        with pytest.raises(KeyError, match="not registered"):
+    def test_get_config_unknown_project_raises_project_not_found_error(self):
+        with pytest.raises(ProjectNotFoundError, match="not registered"):
             self.reg.get_config("ghost-project")
 
-    def test_key_error_message_lists_registered_projects(self):
+    def test_project_not_found_error_carries_project_id(self):
         self.reg.load(TreeProjectBuilder())
-        try:
+        with pytest.raises(ProjectNotFoundError) as exc_info:
             self.reg.get_config("ghost")
-        except KeyError as exc:
-            assert "tree-app" in str(exc)
+        assert exc_info.value.project_id == "ghost"
 
     def test_register_low_level_method(self):
         entry = TreeProjectBuilder().build()

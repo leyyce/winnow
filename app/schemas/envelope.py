@@ -10,11 +10,10 @@ Stage 1 validation is deferred to the registry-resolved Pydantic schema.
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import AwareDatetime, BaseModel, Field
 
 
 class SubmissionMetadata(BaseModel):
@@ -31,7 +30,7 @@ class SubmissionMetadata(BaseModel):
         min_length=1,
         description="Submission variant within the project, e.g. 'tree_measurement'.",
     )
-    submitted_at: datetime = Field(
+    submitted_at: AwareDatetime = Field(
         description="ISO-8601 timestamp (with timezone) of when the client built the envelope.",
     )
     client_version: str | None = Field(
@@ -66,7 +65,7 @@ class UserContext(BaseModel):
         ge=0,
         description="Cumulative submission count for context; must be non-negative.",
     )
-    account_created_at: datetime = Field(
+    account_created_at: AwareDatetime = Field(
         description="ISO-8601 timestamp of account creation; changes only once.",
     )
 

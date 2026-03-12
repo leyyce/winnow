@@ -124,7 +124,7 @@ class SubmissionMetadata(BaseModel):
     project_id: str                       # e.g. "tree-app"
     submission_id: UUID
     submission_type: str                  # e.g. "tree_measurement", "tree_registration"
-    submitted_at: datetime
+    submitted_at: AwareDatetime           # timezone-aware ISO-8601 timestamp (required)
     client_version: str | None = None
 
 class UserContext(BaseModel):
@@ -133,7 +133,7 @@ class UserContext(BaseModel):
     role: str = Field(min_length=1)      # project-specific roles
     trust_level: int = Field(ge=0)        # scale is project-specific
     total_submissions: int = Field(ge=0)
-    account_created_at: datetime
+    account_created_at: AwareDatetime     # timezone-aware ISO-8601 timestamp (required)
 
 class SubmissionEnvelope(BaseModel):
     metadata: SubmissionMetadata
@@ -272,15 +272,16 @@ Content-Type: application/json
     "review_tier": "community_review"
   },
   "thresholds": {
-    "approve": 80,
-    "review": 50,
-    "reject": 50
+    "auto_approve_min": 80,
+    "manual_review_min": 50
   },
   "created_at": "2026-03-10T17:30:01Z"
 }
 ```
 
 > **Note:** The initial response always returns `status: "pending_finalization"`. The Confidence Score, thresholds, and `required_validations` are provided so the client has **immediate metadata for its UI**. The `required_validations` object defines the "Target State" — how many validators are needed, what minimum trust level they require, and whether a specific role (e.g., expert) is mandatory. The client renders its review queue and permissions accordingly. The definitive status is set by the finalization signal.
+>
+> **Threshold design — 2 boundaries, not 3:** The `thresholds` object intentionally contains only two integer fields. Dividing a 0-100 integer scale into three contiguous routing regions requires exactly 2 boundaries. A third `reject` field would be arithmetically redundant (`reject_max = manual_review_min - 1`) and would open the door to configuration gaps (scores that fall into no region) or overlaps (ambiguous routing). The auto-reject region is **implicit**: any score below `manual_review_min` is auto-rejected by the client without Winnow needing to declare an explicit lower bound. See `02_architecture_patterns.md §5` for the full rationale.
 
 ### Response Schema (Conceptual)
 
@@ -295,11 +296,12 @@ class RuleBreakdown(BaseModel):
     details: str | None = None
 
 class ThresholdConfig(BaseModel):
-    approve: float = Field(ge=0.0, le=100.0)
-    review: float = Field(ge=0.0, le=100.0)
-    reject: float = Field(ge=0.0, le=100.0)
+    # 2-boundary integer design: 3 contiguous regions need exactly 2 boundaries.
+    # Scores < manual_review_min are implicitly auto-rejected — no third field.
+    auto_approve_min: int = Field(ge=0, le=100)   # scores >= this → auto-approve
+    manual_review_min: int = Field(ge=0, le=100)  # scores >= this (but < auto_approve_min) → review
     # Cross-field invariant enforced by @model_validator(mode="after"):
-    # approve >= review >= reject
+    # auto_approve_min >= manual_review_min
 
 class RequiredValidations(BaseModel):
     min_validators: int          # e.g., 1, 2, 3
@@ -315,7 +317,7 @@ class ScoringResultResponse(BaseModel):
     breakdown: list[RuleBreakdown]
     required_validations: RequiredValidations
     thresholds: ThresholdConfig
-    created_at: datetime
+    created_at: AwareDatetime             # timezone-aware ISO-8601 timestamp
 ```
 
 ---
@@ -389,7 +391,7 @@ class FinalizationResponse(BaseModel):
     final_status: Literal["approved", "rejected"]
     confidence_score: float              # original score for reference
     trust_adjustment: TrustAdjustment
-    finalized_at: datetime
+    finalized_at: AwareDatetime          # timezone-aware ISO-8601 timestamp
 ```
 
 > **Important:** The `trust_adjustment` is a **recommendation**. Laravel receives it and decides whether to apply it to `users.trust_level`. Winnow never directly modifies the client’s user data.
@@ -437,6 +439,9 @@ All error responses use a consistent structure based on [RFC 7807](https://www.r
 | `422` | `/errors/unknown-project` | `project_id` not registered in the system. |
 | `409` | `/errors/already-finalized` | Submission already finalized with a different status (conflict). |
 | `500` | `/errors/internal` | Unexpected server error. |
+| `501` | `/errors/not-implemented` | Endpoint exists but requires the DB persistence layer (Phase 2 stub). |
+
+> **URI construction:** All `type` values are absolute URIs formed as `{PROBLEM_BASE_URI}/errors/{slug}` where `PROBLEM_BASE_URI` is configured in `Settings` (default: `https://winnow.example.com`). The `instance` field is omitted when not applicable, per RFC 7807 §3.3.
 
 ---
 
@@ -518,7 +523,7 @@ GET /api/v1/tasks/available?project_id=tree-app&user_trust=5&user_role=trusted
 | `user_trust` | int | Yes | The reviewer's current trust level (sent by the client). Scale is project-specific. |
 | `user_role` | string | No | The reviewer's role. Project-specific (e.g., roles defined in the project's governance config). |
 | `page` | int | No | Page number for pagination (default: 1). |
-| `per_page` | int | No | Items per page (default: 20, max: 100). |
+| `per_page` | int | No | Items per page (default: 20, max: `TASK_PAGE_SIZE_MAX` from `Settings`, default 100). |
 
 ### Response (200 OK)
 
@@ -574,7 +579,7 @@ class TaskItem(BaseModel):
     confidence_score: float
     review_tier: str
     required_validations: RequiredValidations
-    submitted_at: datetime
+    submitted_at: AwareDatetime           # timezone-aware ISO-8601 timestamp
 
 class TaskListResponse(BaseModel):
     tasks: list[TaskItem]

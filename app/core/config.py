@@ -41,6 +41,19 @@ class Settings(BaseSettings):
         default="dev-insecure-key",
         description="Shared API key expected in the X-API-Key header (prototype auth).",
     )
+    PROBLEM_BASE_URI: str = Field(
+        default="https://winnow.example.com",
+        description=(
+            "Base URI prepended to all RFC 7807 problem type strings, "
+            "e.g. 'https://winnow.example.com/errors/validation-error'. "
+            "Override per environment to match the deployed hostname."
+        ),
+    )
+    TASK_PAGE_SIZE_MAX: int = Field(
+        default=100,
+        ge=1,
+        description="Maximum allowed value for the per_page query parameter on task list endpoints.",
+    )
 
 
 # ── Module-level singleton — import this in services and API modules ──────────

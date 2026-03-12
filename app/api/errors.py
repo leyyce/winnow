@@ -4,7 +4,8 @@ FastAPI exception handlers — register all error handlers on the application.
 All handlers return RFC 7807 ``ProblemDetail`` JSON so clients receive a
 consistent, machine-readable error shape regardless of what went wrong.
 
-Error type URIs follow the contract in docs/architecture/03_api_contracts.md §4.
+Error type URIs are absolute URIs constructed from ``settings.PROBLEM_BASE_URI``
+following the contract in docs/architecture/03_api_contracts.md §4.
 """
 
 from __future__ import annotations
@@ -16,25 +17,36 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
+from app.core.config import settings
+from app.core.exceptions import NotImplementedYetError, ProjectNotFoundError
 from app.schemas.errors import FieldError, ProblemDetail
 
 logger = logging.getLogger(__name__)
 
 
 def _problem_response(problem: ProblemDetail) -> JSONResponse:
-    """Serialise a ``ProblemDetail`` as a JSON response with the correct status code."""
+    """Serialise a ``ProblemDetail`` as a JSON response with the correct status code.
+
+    ``None`` fields (e.g. ``instance`` when not applicable) are omitted from
+    the response body in accordance with RFC 7807 §3.3.
+    """
     return JSONResponse(
         status_code=problem.status,
-        content=problem.model_dump(),
+        content=problem.model_dump(exclude_none=True),
         media_type="application/problem+json",
     )
+
+
+def _type_uri(slug: str) -> str:
+    """Return an absolute RFC 7807 type URI for the given slug."""
+    return f"{settings.PROBLEM_BASE_URI}/errors/{slug}"
 
 
 def register_exception_handlers(app: FastAPI) -> None:
     """Attach all Winnow exception handlers to the given FastAPI application."""
 
     @app.exception_handler(RequestValidationError)
-    async def _handle_validation_error(
+    async def _handle_request_validation_error(
         request: Request,
         exc: RequestValidationError,
     ) -> JSONResponse:
@@ -48,7 +60,7 @@ def register_exception_handlers(app: FastAPI) -> None:
             for err in exc.errors()
         ]
         problem = ProblemDetail(
-            type="/errors/validation-error",
+            type=_type_uri("validation-error"),
             title="Payload Validation Failed",
             status=422,
             detail=f"Validation failed: {len(field_errors)} error(s) in request.",
@@ -72,7 +84,7 @@ def register_exception_handlers(app: FastAPI) -> None:
             for err in exc.errors()
         ]
         problem = ProblemDetail(
-            type="/errors/validation-error",
+            type=_type_uri("validation-error"),
             title="Payload Validation Failed",
             status=422,
             detail=f"Stage 1 validation failed: {len(field_errors)} error(s) in payload.",
@@ -81,17 +93,47 @@ def register_exception_handlers(app: FastAPI) -> None:
         )
         return _problem_response(problem)
 
-    @app.exception_handler(KeyError)
-    async def _handle_key_error(
+    @app.exception_handler(ProjectNotFoundError)
+    async def _handle_project_not_found(
         request: Request,
-        exc: KeyError,
+        exc: ProjectNotFoundError,
     ) -> JSONResponse:
         """422 — project_id not registered in the registry."""
         problem = ProblemDetail(
-            type="/errors/unknown-project",
+            type=_type_uri("unknown-project"),
             title="Unknown Project",
             status=422,
-            detail=str(exc).strip("'\""),
+            detail=str(exc),
+            instance=str(request.url.path),
+        )
+        return _problem_response(problem)
+
+    @app.exception_handler(NotImplementedYetError)
+    async def _handle_not_implemented_yet(
+        request: Request,
+        exc: NotImplementedYetError,
+    ) -> JSONResponse:
+        """501 — endpoint exists but requires the DB persistence layer."""
+        problem = ProblemDetail(
+            type=_type_uri("not-implemented"),
+            title="Not Implemented",
+            status=501,
+            detail=str(exc),
+            instance=str(request.url.path),
+        )
+        return _problem_response(problem)
+
+    @app.exception_handler(400)
+    async def _handle_bad_request(
+        request: Request,
+        exc: Exception,
+    ) -> JSONResponse:
+        """400 — malformed request (e.g. invalid JSON body, truncated payload)."""
+        problem = ProblemDetail(
+            type=_type_uri("bad-request"),
+            title="Bad Request",
+            status=400,
+            detail="The request body is malformed or could not be parsed.",
             instance=str(request.url.path),
         )
         return _problem_response(problem)
@@ -104,7 +146,7 @@ def register_exception_handlers(app: FastAPI) -> None:
         """500 — unhandled exception."""
         logger.exception("Unhandled exception for %s %s", request.method, request.url.path)
         problem = ProblemDetail(
-            type="/errors/internal",
+            type=_type_uri("internal"),
             title="Internal Server Error",
             status=500,
             detail="An unexpected error occurred. Please try again later.",

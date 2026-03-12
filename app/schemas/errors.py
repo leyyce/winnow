@@ -59,8 +59,8 @@ class ProblemDetail(BaseModel):
         min_length=1,
         description="Human-readable explanation specific to this occurrence.",
     )
-    instance: str = Field(
-        default="",
+    instance: str | None = Field(
+        default=None,
         description="URI reference identifying the specific occurrence of the problem.",
     )
     errors: list[FieldError] = Field(

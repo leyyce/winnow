@@ -12,10 +12,9 @@ References
 
 from __future__ import annotations
 
-from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import AwareDatetime, BaseModel, Field
 
 from app.schemas.results import RequiredValidations
 
@@ -51,7 +50,7 @@ class TaskItem(BaseModel):
     required_validations: RequiredValidations = Field(
         description="Governance Target State — review requirements for this submission.",
     )
-    submitted_at: datetime = Field(
+    submitted_at: AwareDatetime = Field(
         description="ISO-8601 timestamp of when the submission was originally created.",
     )
 

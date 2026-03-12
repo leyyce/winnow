@@ -7,10 +7,34 @@
 #   • APP_DOMAIN in .env must have a DNS A/AAAA record pointing to this server
 #   • Ports 80 and 443 must be reachable from the internet (ACME HTTP-01 challenge)
 #   • ACME_EMAIL in .env is used by Caddy to register with Let's Encrypt
+#   • DATABASE_URL in .env must be set to a reachable PostgreSQL instance
+#     (the `db` service below provides one; for managed DB, remove it and
+#      point DATABASE_URL at your managed endpoint instead)
 
 name: ${APP_NAME:-winnow}
 
 services:
+
+  # ── PostgreSQL database ───────────────────────────────────────────────────
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-winnow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-winnow}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-winnow} -d ${POSTGRES_DB:-winnow}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   # ── FastAPI application (prod) ────────────────────────────────────────────
   api:
@@ -23,6 +47,9 @@ services:
       - .env
     expose:
       - "8000"
+    depends_on:
+      db:
+        condition: service_healthy
     deploy:
       resources:
         limits:
@@ -53,5 +80,6 @@ services:
         condition: service_healthy
 
 volumes:
+  pg_data:
   caddy_data:
   caddy_config:

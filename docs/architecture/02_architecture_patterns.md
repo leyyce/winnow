@@ -160,7 +160,7 @@ The registry domain lives in `app/registry/` and is composed of three layers:
 
 | Module | Responsibility |
 |---|---|
-| `manager.py` | `_Registry` singleton + `ProjectRegistryEntry` dataclass. Value-agnostic — stores whatever a builder hands it. See [Pragmatic Domain Imports](#pragmatic-domain-imports-w2-trade-off) note below. |
+| `manager.py` | `Registry` singleton + `ProjectRegistryEntry` dataclass. Value-agnostic — stores whatever a builder hands it. See [Pragmatic Domain Imports](#pragmatic-domain-imports-w2-trade-off) note below. |
 | `base.py` | `ProjectBuilder` ABC — declares `project_id` property and `build() → ProjectRegistryEntry` method. |
 | `projects/<name>.py` | Concrete builder per project — the single authoritative source for all project-specific numeric config. |
 | `app/bootstrap.py` | Auto-discovers every concrete `ProjectBuilder` in `app.registry.projects` via `pkgutil`/`importlib`/`inspect` and calls `registry.load(builder)` for each. Adding a new project file is sufficient — `bootstrap.py` never needs to be edited. |
@@ -316,7 +316,7 @@ No changes to `bootstrap.py`, `registry/manager.py`, or any other infrastructure
 
 `bootstrap()` must be **explicitly called** — it does **not** execute on import. The canonical integration points are:
 
-- **Production:** call `bootstrap()` inside the FastAPI `lifespan` async context manager in `main.py`, before the application begins serving requests.
+- **Production:** call `setup_logging()` first, then `bootstrap()` inside the FastAPI `lifespan` async context manager in `main.py`. Logging must be configured before bootstrap runs so that all startup warnings (e.g. skipped project builders) are emitted as valid JSON records.
 - **Tests:** call `bootstrap()` once via a session-scoped `autouse` fixture in `conftest.py`. This ensures the registry is populated for all tests without duplicating setup.
 
 This design prevents import-time side effects: a syntax error or misconfiguration in any project builder file cannot crash the application or contaminate unrelated test modules.
@@ -463,13 +463,33 @@ The Confidence Score is included in the initial response to **help the client de
 
 Thresholds are **per-project** and stored in the registry/config. This allows each Citizen Science project to tune its own tolerance. **Winnow advises; the client decides.**
 
-### ThresholdConfig Cross-Field Validation
+### ThresholdConfig — 2-Boundary Integer Design
 
-`ThresholdConfig` enforces a cross-field semantic constraint via a `@model_validator(mode="after")`:
+#### Why 2 boundaries, not 3?
 
-$$approve \geq review \geq reject$$
+A 0-100 integer Confidence Score scale divided into three contiguous, non-overlapping routing regions requires **exactly 2 boundary values**. The old 3-field design (`approve`, `review`, `reject`) allowed two classes of misconfiguration that a 2-field design eliminates by construction:
 
-A configuration where, for example, `approve=20, review=80, reject=90` would be logically nonsensical (the auto-approval bar would be lower than the rejection bar). Pydantic raises a `ValueError` at model construction time if this ordering is violated, preventing silent governance corruption. Each value is still independently constrained to `[0, 100]`.
+| Failure mode | 3-field system | 2-field system |
+|---|---|---|
+| **Routing gap** | `reject=20, review=50` → scores 21–49 fall into no region | Impossible: `[0, manual_review_min)` is always contiguous |
+| **Overlapping logic** | `approve=50, reject=50` → ambiguous | Impossible: only one ordering constraint needed |
+
+The **auto-reject region is implicit**: any score `< manual_review_min` is auto-rejected by the client. Winnow does not return a third field because it would be arithmetically redundant (`reject_max = manual_review_min - 1`) and could create the illusion that a gap between the review and reject bands is permissible.
+
+#### Fields
+
+| Field | Type | Constraint | Meaning |
+|---|---|---|---|
+| `auto_approve_min` | `int` | `[0, 100]` | Scores ≥ this value → client may auto-approve |
+| `manual_review_min` | `int` | `[0, 100]` | Scores ≥ this (but < `auto_approve_min`) → queue for review; scores below → implicit auto-reject |
+
+#### Cross-field validation
+
+`ThresholdConfig` enforces the single ordering constraint via `@model_validator(mode="after")`:
+
+$$auto\_approve\_min \geq manual\_review\_min$$
+
+Pydantic raises a `ValueError` at model construction time if this is violated, preventing silent governance corruption. The special case `auto_approve_min == manual_review_min` collapses the review band to zero width (all submissions either auto-approve or auto-reject) — degenerate but logically valid.
 
 ---
 
@@ -716,3 +736,5 @@ graph TB
 ```
 
 > **The golden rule:** Domain logic (`scoring/`, `governance/`) never imports from infrastructure (`db/`, `models/`) or presentation (`api/`). It receives validated data and returns plain results. The Trust Advisor receives pre-computed user stats (derived by the service layer from the submissions table) — it does not query the database itself. The Governance Policy receives scoring results and returns review requirements — it does not query the database itself.
+>
+> **Exception flow contract:** Services (`services/`) raise domain exceptions from `app/core/exceptions.py` (`ProjectNotFoundError`, `NotImplementedYetError`). They never import or raise `fastapi.HTTPException`. The `api/errors.py` exception handlers catch each domain exception type and translate it to the correct RFC 7807 `ProblemDetail` response. This keeps the service layer fully decoupled from the HTTP transport layer.

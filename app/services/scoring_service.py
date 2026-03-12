@@ -14,17 +14,11 @@ import logging
 from datetime import datetime, timezone
 from uuid import UUID
 
-from pydantic import ValidationError
-
+from app.core.exceptions import NotImplementedYetError
 from app.registry.manager import registry
 from app.schemas.envelope import SubmissionEnvelope
-from app.schemas.finalization import (
-    FinalizationRequest,
-    FinalizationResponse,
-    TrustAdjustment,
-)
+from app.schemas.finalization import FinalizationRequest, FinalizationResponse
 from app.schemas.results import RuleBreakdown, ScoringResultResponse
-from app.scoring.common.trust_advisor import UserSubmissionStats
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +29,7 @@ async def process_submission(envelope: SubmissionEnvelope) -> ScoringResultRespo
 
     Steps
     -----
-    1. Resolve project config from registry (KeyError → 422 at API layer).
+    1. Resolve project config from registry (ProjectNotFoundError → 422 at API layer).
     2. Validate raw payload against project schema (ValidationError → 422).
     3. [STUB] Persist submission — not implemented until DB layer is added.
     4. Run scoring pipeline → PipelineResult.
@@ -45,7 +39,7 @@ async def process_submission(envelope: SubmissionEnvelope) -> ScoringResultRespo
 
     Raises
     ------
-    KeyError
+    ProjectNotFoundError
         If ``envelope.metadata.project_id`` is not registered.
     pydantic.ValidationError
         If the raw payload fails Stage 1 schema validation.
@@ -53,7 +47,7 @@ async def process_submission(envelope: SubmissionEnvelope) -> ScoringResultRespo
     project_id = envelope.metadata.project_id
     submission_id = envelope.metadata.submission_id
 
-    # Step 1 — resolve project config (raises KeyError on unknown project)
+    # Step 1 — resolve project config (raises ProjectNotFoundError on unknown project)
     config = registry.get_config(project_id)
 
     # Step 2 — Stage 1: validate raw payload against project-specific schema
@@ -75,18 +69,14 @@ async def process_submission(envelope: SubmissionEnvelope) -> ScoringResultRespo
     # TODO: persist scoring result to DB
 
     # Step 7 — assemble and return response
+    # Build weight lookup once (O(N)) to avoid O(N²) double-scan per rule.
+    weight_map = {rule.name: rule.weight for rule in config.pipeline.rules}
     breakdown = [
         RuleBreakdown(
             rule=r.rule_name,
-            weight=next(
-                (rule.weight for rule in config.pipeline.rules if rule.name == r.rule_name),
-                0.0,
-            ),
+            weight=(w := weight_map.get(r.rule_name, 0.0)),
             score=r.score,
-            weighted_score=r.score * next(
-                (rule.weight for rule in config.pipeline.rules if rule.name == r.rule_name),
-                0.0,
-            ) * 100.0,
+            weighted_score=r.score * w * 100.0,
             details=r.details,
         )
         for r in pipeline_result.breakdown
@@ -100,7 +90,6 @@ async def process_submission(envelope: SubmissionEnvelope) -> ScoringResultRespo
             "confidence_score": pipeline_result.total_score,
         },
     )
-
     return ScoringResultResponse(
         submission_id=submission_id,
         project_id=project_id,
@@ -122,24 +111,18 @@ async def finalize_submission(
 
     Steps
     -----
-    1. [STUB] Load submission — raises HTTPException(501) until DB layer is added.
+    1. [STUB] Load submission — raises NotImplementedYetError until DB layer is added.
     2. [STUB] Update submission status.
     3. Compute trust adjustment recommendation via TrustAdvisor.
     4. Return FinalizationResponse.
 
     Raises
     ------
-    fastapi.HTTPException(501)
+    NotImplementedYetError
         Always, until the DB persistence layer is implemented.
     """
-    from fastapi import HTTPException
-
     # Step 1 — [STUB] load submission from DB
     # TODO: load submission from DB and resolve config
-    raise HTTPException(
-        status_code=501,
-        detail=(
-            f"finalize_submission({submission_id!s}) is not yet implemented. "
-            "The database persistence layer has not been added."
-        ),
+    raise NotImplementedYetError(
+        f"finalize_submission({submission_id!s})"
     )

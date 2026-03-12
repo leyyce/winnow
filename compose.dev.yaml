@@ -11,10 +11,33 @@
 # SSL setup (one-time, after first `docker compose up`):
 #   docker compose exec caddy caddy trust
 #   Restart your browser, then visit https://{APP_DOMAIN}.localhost
+#
+# Venv strategy
+#   The container venv lives at /opt/venv (outside the /app source tree).
+#   It is stored in the named volume `dev_venv` so it survives container
+#   restarts and plain `docker compose down`. After adding/removing a
+#   dependency, simply run `docker compose up --build` — no `down -v` needed.
 
 name: ${APP_NAME:-winnow}-dev
 
 services:
+
+  # ── PostgreSQL database ───────────────────────────────────────────────────
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: winnow
+      POSTGRES_PASSWORD: winnow
+      POSTGRES_DB: winnow
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U winnow -d winnow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
 
   # ── FastAPI application (dev) ─────────────────────────────────────────────
   api:
@@ -22,16 +45,23 @@ services:
       context: .
       dockerfile: Dockerfile
       target: dev
+    restart: unless-stopped
     volumes:
       # Bind-mount app source for instant hot-reload – no image rebuild needed.
-      # We mount only the app subfolder to avoid shadowing the container's /app/pyproject.toml etc.
+      # We mount only the app subfolder to avoid shadowing /app/pyproject.toml etc.
       - ./app:/app/app:ro
-      # Protect the container's .venv from host shadowing
-      - /app/.venv
+      # Named volume for the container venv at /opt/venv.
+      # Lives outside the bind-mount tree so the host source never shadows it.
+      # Persists across restarts and plain `docker compose down`.
+      # Refreshed automatically on `docker compose up --build`.
+      - dev_venv:/opt/venv
     env_file:
       - .env
     expose:
       - "8000"
+    depends_on:
+      db:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 10s
@@ -58,5 +88,7 @@ services:
         condition: service_healthy
 
 volumes:
+  pg_data:
+  dev_venv:
   caddy_data:
   caddy_config:

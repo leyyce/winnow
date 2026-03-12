@@ -4,17 +4,23 @@
 # Stages
 #   base     – shared Python + uv tooling, env vars
 #   dev      – dev deps only; source is bind-mounted at runtime (hot-reload)
-#   builder  – prod deps + project installed non-editable into .venv
+#   builder  – prod deps + project installed non-editable into /app/.venv
 #   prod     – lean runtime: no uv, non-root user, healthcheck
 #
 # Build targets:
-#   Dev  → image built by compose.override.yaml  (target: dev)
-#   Prod → image built by compose.prod.yaml      (target: prod)
+#   Dev  → image built by compose.dev.yaml  (target: dev)
+#   Prod → image built by compose.yaml      (target: prod)
+#
+# Python version
+#   Controlled by the build arg PYTHON_VERSION (default: 3.14).
+#   Used by ALL stages so base, dev, and prod always run identical Python.
+#   To upgrade: docker build --build-arg PYTHON_VERSION=3.15 ...
 ###############################################################################
 
+ARG PYTHON_VERSION=3.14
 
 # ── base: shared tooling ──────────────────────────────────────────────────────
-FROM python:3.14-slim-bookworm AS base
+FROM python:${PYTHON_VERSION}-slim-bookworm AS base
 
 # curl is used by the HEALTHCHECK in both dev and prod.
 RUN apt-get update \
@@ -38,6 +44,14 @@ WORKDIR /app
 # ── dev: all deps including dev group; source bind-mounted from host ──────────
 FROM base AS dev
 
+# The dev venv lives at /opt/venv — outside the /app source tree.
+# This means the bind-mount (./app:/app/app) never shadows the installed
+# packages, eliminating the need for an anonymous Docker volume and the
+# painful "docker compose down -v" workflow when dependencies change.
+# A named volume (dev_venv:/opt/venv) in compose.dev.yaml preserves the
+# venv across container restarts and survives plain `docker compose down`.
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv
+
 # Install ALL deps (incl. dev group) without the project itself.
 #
 # Using --mount=type=bind for pyproject.toml and uv.lock means these files are
@@ -52,11 +66,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-install-project
 
 # Activate the venv for all subsequent commands and at container runtime.
-ENV PATH="/app/.venv/bin:$PATH"
+ENV PATH="/opt/venv/bin:$PATH"
 
-# Source is bind-mounted via compose.override.yaml, so hot-reload works without
-# rebuilding the image. The .venv is protected by an anonymous volume so the
-# host directory doesn't shadow it (see compose.override.yaml).
+# Source is bind-mounted via compose.dev.yaml, so hot-reload works without
+# rebuilding the image.
 CMD ["fastapi", "dev", "app/main.py", "--host", "0.0.0.0", "--port", "8000"]
 
 
@@ -81,7 +94,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 
 # ── prod: lean runtime image ──────────────────────────────────────────────────
-FROM python:3.12-slim-bookworm AS prod
+FROM python:${PYTHON_VERSION}-slim-bookworm AS prod
 
 # Non-root user – defence-in-depth if the container is ever compromised.
 RUN groupadd --system --gid 1001 app \
@@ -104,11 +117,6 @@ ENV \
     PYTHONUNBUFFERED=1 \
     PYTHONFAULTHANDLER=1
 
-# Requires a GET /health endpoint in your FastAPI app.
-# Example:
-#   @app.get("/health")
-#   async def health() -> dict:
-#       return {"status": "ok"}
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
     CMD curl -fsSL http://localhost:8000/health || exit 1
 

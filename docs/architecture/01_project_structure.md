@@ -38,7 +38,7 @@ winnow/
 │   │       ├── finalization.py     # PATCH /submissions/{id}/final-status — ground-truth signal from client
 │   │       ├── tasks.py            # GET   /tasks/available           — query reviewable submissions (governance)
 │   │       ├── results.py          # GET   /results                  — query scoring outcomes
-│   │       └── health.py           # GET   /health                   — liveness / readiness probes
+│   │       └── health.py           # GET /api/v1/health (canonical) + GET /health (infra alias)
 │   │
 │   ├── schemas/                    # Pydantic V2 models — API contracts & Stage 1 validation
 │   │   ├── __init__.py
@@ -67,7 +67,7 @@ winnow/
 │   ├── registry/                   # Top-level registry domain — wires schemas, scoring & governance
 │   │   ├── __init__.py             # Re-exports: ProjectRegistryEntry, ProjectBuilder, registry
 │   │   ├── base.py                 # ProjectBuilder ABC — interface every project must implement
-│   │   ├── manager.py              # _Registry singleton + ProjectRegistryEntry dataclass
+│   │   ├── manager.py              # Registry singleton + ProjectRegistryEntry dataclass
 │   │   └── projects/               # One ProjectBuilder subclass per registered project
 │   │       ├── __init__.py
 │   │       └── trees.py            # TreeProjectBuilder — composer for tree-app (schemas+rules+governance)
@@ -106,8 +106,9 @@ winnow/
 │   │
 │   ├── core/                       # Cross-cutting application configuration
 │   │   ├── __init__.py
-│   │   ├── config.py               # Pydantic Settings (DATABASE_URL, DEBUG, …)
-│   │   └── logging.py              # Structured logging setup
+│   │   ├── config.py               # Pydantic Settings (DATABASE_URL, DEBUG, PROBLEM_BASE_URI, …)
+│   │   ├── exceptions.py           # Domain exception hierarchy (WinnowError, ProjectNotFoundError, …)
+│   │   └── logging.py              # Structured JSON logging (python-json-logger)
 │   │
 │   └── tests/                      # Pytest test suite (mirrors app/ structure)
 │       ├── __init__.py
@@ -194,14 +195,14 @@ The scoring pipeline (Stages 1 → 2 → 4-input) runs synchronously on submissi
 | **Role** | Orchestrate domain operations: receive a submission, run Stage 1 validation via the registry's Pydantic schema, trigger the Stage 2 + Stage 4 scoring pipeline, determine governance requirements, persist results, process finalization signals, and serve task queries. |
 | **Contains** | Stateless service functions or thin classes that coordinate `scoring/`, `governance/` rules and `models/` persistence. |
 | **Key files** | `scoring_service.py` — resolves the project config from the registry, validates the raw payload against the project-specific Pydantic schema (Stage 1), then passes the validated object to the `ScoringPipeline` (Stage 2 + Stage 4 input). After scoring, invokes the governance policy to compute `required_validations`. On finalization, delegates to the Trust Advisor to compute the `trust_adjustment` delta (Stage 4 output). `governance_service.py` — queries eligible tasks for a given trust level using the project's governance policy. |
-| **Rule** | May depend on `scoring/`, `governance/`, `models/`, `schemas/`; must **not** depend on `api/`. |
+| **Rule** | May depend on `scoring/`, `governance/`, `models/`, `schemas/`, `core/`; must **not** depend on `api/`. Services raise domain exceptions from `core/exceptions.py` — never `fastapi.HTTPException`. |
 
 ### `app/registry/` — Registry Domain (Project Composer)
 
 | Concern | Detail |
 |---|---|
 | **Role** | The single top-level domain that wires together schemas, scoring rules, and governance policies for each registered project. Decoupled from all three sub-domains it composes. |
-| **Contains** | `ProjectRegistryEntry` dataclass, `_Registry` singleton, `ProjectBuilder` ABC, and one concrete `ProjectBuilder` per project under `projects/`. |
+| **Contains** | `ProjectRegistryEntry` dataclass, `Registry` singleton, `ProjectBuilder` ABC, and one concrete `ProjectBuilder` per project under `projects/`. |
 | **Key abstraction** | `ProjectBuilder` (Open/Closed): adding a new project means creating a new subclass in `registry/projects/` — `bootstrap.py` auto-discovers and loads it, no existing code changes required. |
 | **Rule** | No HTTP, no DB imports. The registry is populated at startup by `bootstrap.py` and consumed by services via dependency injection. |
 
@@ -247,7 +248,7 @@ The scoring pipeline (Stages 1 → 2 → 4-input) runs synchronously on submissi
 | Concern | Detail |
 |---|---|
 | **Role** | Centralised application settings, logging setup, and any shared utilities. |
-| **Contains** | `config.py` using `pydantic-settings` to read environment variables with validation. |
+| **Contains** | `config.py` — `pydantic-settings` for environment variable validation. `exceptions.py` — domain exception hierarchy (`WinnowError` → `ProjectNotFoundError`, `NotImplementedYetError`). `logging.py` — structured JSON logging via `python-json-logger`. |
 
 ### `app/tests/` — Test Suite
 
@@ -272,18 +273,20 @@ graph TD
     GOVERNANCE["governance/ (Domain — Workflow Authority)"]
     MODELS["models/ (SQLAlchemy)"]
     DB["db/ (Infrastructure)"]
-    CORE["core/ (Config)"]
+    CORE["core/ (Config + Exceptions + Logging)"]
 
     API --> SCHEMAS
     API --> SERVICES
+    API --> CORE
     SERVICES --> SCORING
     SERVICES --> GOVERNANCE
     SERVICES --> MODELS
     SERVICES --> SCHEMAS
-    MODELS --> DB
-    API --> CORE
     SERVICES --> CORE
+    MODELS --> DB
     DB --> CORE
 ```
 
 > **Key constraint:** `scoring/` and `governance/` have **zero** dependencies on `models/`, `db/`, or `api/`. This keeps the scoring engine and governance logic portable and testable in isolation. The `governance/` layer depends on scoring outputs (the Confidence Score) but not on scoring internals.
+>
+> **Exception flow:** Services raise domain exceptions from `core/exceptions.py` (`ProjectNotFoundError`, `NotImplementedYetError`). The `api/errors.py` handlers catch these and translate them to RFC 7807 `ProblemDetail` responses. The `fastapi` package is never imported by any service module.

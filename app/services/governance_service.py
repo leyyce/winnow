@@ -33,17 +33,17 @@ async def get_available_tasks(
 
     Steps
     -----
-    1. Resolve project config from registry (KeyError → 422 at API layer).
+    1. Resolve project config from registry (ProjectNotFoundError → 422 at API layer).
     2. [STUB] Query pending submissions — returns [] until DB layer is added.
     3. Filter via governance_policy.is_eligible_reviewer() for each submission.
     4. Return paginated TaskListResponse.
 
     Raises
     ------
-    KeyError
+    ProjectNotFoundError
         If ``project_id`` is not registered in the registry.
     """
-    # Step 1 — resolve project config (raises KeyError on unknown project)
+    # Step 1 — resolve project config (raises ProjectNotFoundError on unknown project)
     config = registry.get_config(project_id)
 
     # Step 2 — [STUB] query pending submissions from DB

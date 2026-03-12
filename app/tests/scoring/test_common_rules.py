@@ -17,6 +17,7 @@ from app.scoring.common.trust_advisor import (
 )
 from app.scoring.common.trust_level import TrustLevelRule
 from app.registry.manager import registry
+from app.core.exceptions import ProjectNotFoundError
 from app.tests.conftest import _ctx, _payload, _user_stats
 
 
@@ -146,8 +147,8 @@ class TestScoringRegistry:
         entry = registry.get_config("tree-app")
         assert entry is not None
 
-    def test_unknown_project_raises_key_error(self):
-        with pytest.raises(KeyError, match="not registered"):
+    def test_unknown_project_raises_project_not_found_error(self):
+        with pytest.raises(ProjectNotFoundError, match="not registered"):
             registry.get_config("nonexistent-project")
 
     def test_tree_app_has_payload_schema(self):
@@ -171,7 +172,7 @@ class TestScoringRegistry:
 
     def test_tree_app_thresholds_present(self):
         entry = registry.get_config("tree-app")
-        assert entry.thresholds.approve > entry.thresholds.review
+        assert entry.thresholds.auto_approve_min >= entry.thresholds.manual_review_min
 
     def test_tree_app_has_trust_advisor(self):
         entry = registry.get_config("tree-app")

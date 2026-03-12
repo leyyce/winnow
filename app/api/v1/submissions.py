@@ -12,11 +12,10 @@ References
 from __future__ import annotations
 
 from fastapi import APIRouter
-from fastapi.responses import JSONResponse
 
 from app.schemas.envelope import SubmissionEnvelope
 from app.schemas.results import ScoringResultResponse
-from app.services import scoring_service
+from app.services import submission_service
 
 router = APIRouter(tags=["submissions"])
 
@@ -36,4 +35,4 @@ async def create_submission(
     envelope: SubmissionEnvelope,
 ) -> ScoringResultResponse:
     """Score a submission and return the result (201 Created)."""
-    return await scoring_service.process_submission(envelope)
+    return await submission_service.submit(envelope)

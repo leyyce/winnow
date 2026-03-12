@@ -2,8 +2,8 @@
 Registry manager — container and lookup for all registered projects.
 
 ``ProjectRegistryEntry`` is a fully assembled configuration bundle for one
-project. ``_Registry`` is the internal singleton that stores and resolves
-entries by project_id.
+project. ``Registry`` is the singleton that stores and resolves entries by
+project_id.
 
 Design notes
 ------------
@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Type
 
 from pydantic import BaseModel
 
+from app.core.exceptions import ProjectNotFoundError
 from app.governance.base import GovernancePolicy
 from app.schemas.results import ThresholdConfig
 from app.scoring.common.trust_advisor import TrustAdvisor
@@ -61,10 +62,10 @@ class ProjectRegistryEntry:
     governance_policy: GovernancePolicy  # review tiers + reviewer eligibility
 
 
-class _Registry:
+class Registry:
     """
-    Internal registry. Projects are loaded at startup by the bootstrap module.
-    The registry manager is deliberately ignorant of any project-specific logic.
+    Project registry singleton. Projects are loaded at startup by the bootstrap
+    module. The registry is deliberately ignorant of any project-specific logic.
     """
 
     def __init__(self) -> None:
@@ -85,15 +86,12 @@ class _Registry:
     def get_config(self, project_id: str) -> ProjectRegistryEntry:
         """
         Return the ``ProjectRegistryEntry`` for the given project_id.
-        Raises ``KeyError`` with a descriptive message if not registered.
+        Raises ``ProjectNotFoundError`` with a descriptive message if not registered.
         """
         try:
             return self._entries[project_id]
         except KeyError:
-            raise KeyError(
-                f"Project '{project_id}' is not registered. "
-                f"Registered projects: {list(self._entries)}"
-            )
+            raise ProjectNotFoundError(project_id)
 
     @property
     def registered_projects(self) -> list[str]:
@@ -102,4 +100,4 @@ class _Registry:
 
 
 # ── Module-level singleton — consumed by services via dependency injection ───
-registry = _Registry()
+registry = Registry()

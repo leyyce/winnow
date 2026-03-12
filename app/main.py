@@ -2,8 +2,17 @@
 Winnow FastAPI application factory.
 
 The lifespan handler bootstraps the project registry and sets up structured
-logging before the first request is served. Exception handlers and the v1
-router are registered on the application instance.
+logging before the first request is served. ``setup_logging`` is called first
+so that all bootstrap log records are emitted as valid JSON from startup.
+Exception handlers and the v1 router are registered on the application instance.
+
+Health endpoint routing strategy
+---------------------------------
+The health router is mounted twice:
+  - Inside ``v1_router`` → GET /api/v1/health  (canonical versioned path)
+  - At application root  → GET /health         (permanent infrastructure alias)
+This zero-breaking-change approach lets Docker HEALTHCHECK, load balancers, and
+Kubernetes probes continue using /health while API consumers use the versioned path.
 
 References
 ----------
@@ -29,11 +38,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """
     Application lifespan handler.
 
-    Runs bootstrap (fault-tolerant auto-discovery of ProjectBuilders) and
-    structured logging setup before yielding to serve requests.
+    Structured logging is configured first so that bootstrap warnings are
+    captured as JSON records, then the project registry is populated via
+    fault-tolerant auto-discovery of ProjectBuilders.
     """
-    bootstrap()
     setup_logging()
+    bootstrap()
     yield
 
 
@@ -45,5 +55,7 @@ app = FastAPI(
 )
 
 register_exception_handlers(app)
-app.include_router(health_router)
 app.include_router(v1_router)
+# Permanent infrastructure alias: GET /health → same handler as GET /api/v1/health.
+# Docker HEALTHCHECK, load balancers, and Kubernetes probes target this path.
+app.include_router(health_router)

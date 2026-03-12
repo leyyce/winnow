@@ -143,4 +143,4 @@ async def test_post_submission_unknown_project_rfc7807_type(async_client: AsyncC
     response = await async_client.post("/api/v1/submissions", json=envelope)
 
     body = response.json()
-    assert body["type"] == "/errors/unknown-project"
+    assert body["type"].endswith("/errors/unknown-project")

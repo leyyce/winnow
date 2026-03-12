@@ -12,9 +12,9 @@ References
 
 from __future__ import annotations
 
-from app.registry.manager import _Registry, registry
+from app.registry.manager import Registry, registry
 
 
-def get_registry() -> _Registry:
+def get_registry() -> Registry:
     """Return the global project registry singleton."""
     return registry

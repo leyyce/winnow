@@ -82,7 +82,7 @@ class TreeProjectBuilder(ProjectBuilder):
         ]
 
         # ── Advisory thresholds for client-side routing ──────────────────────
-        thresholds = ThresholdConfig(approve=80.0, review=50.0, reject=50.0)
+        thresholds = ThresholdConfig(auto_approve_min=80, manual_review_min=50)
 
         # ── Stage 4-output: Trust Advisor ────────────────────────────────────
         trust_advisor = TrustAdvisor(

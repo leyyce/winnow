@@ -17,6 +17,7 @@ from pydantic import ValidationError
 from app.schemas.envelope import SubmissionEnvelope, SubmissionMetadata
 from app.schemas.results import ScoringResultResponse
 from app.services.scoring_service import process_submission
+from app.core.exceptions import ProjectNotFoundError
 from app.tests.conftest import _ctx, _payload
 
 
@@ -90,11 +91,10 @@ async def test_process_submission_required_validations_shape() -> None:
 
 
 async def test_process_submission_thresholds_ordered() -> None:
-    """Returned thresholds must satisfy approve >= review >= reject."""
+    """Returned thresholds must satisfy auto_approve_min >= manual_review_min (2-boundary design)."""
     result = await process_submission(_envelope())
-
     t = result.thresholds
-    assert t.approve >= t.review >= t.reject
+    assert t.auto_approve_min >= t.manual_review_min
 
 
 async def test_process_submission_created_at_is_datetime() -> None:
@@ -107,11 +107,11 @@ async def test_process_submission_created_at_is_datetime() -> None:
 
 # ── Unknown project ───────────────────────────────────────────────────────────
 
-async def test_process_submission_unknown_project_raises_key_error() -> None:
-    """Unknown project_id must raise KeyError before any scoring runs."""
+async def test_process_submission_unknown_project_raises_project_not_found_error() -> None:
+    """Unknown project_id must raise ProjectNotFoundError before any scoring runs."""
     envelope = _envelope(project_id="no-such-project")
 
-    with pytest.raises(KeyError, match="no-such-project"):
+    with pytest.raises(ProjectNotFoundError, match="no-such-project"):
         await process_submission(envelope)
 
 

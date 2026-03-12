@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Query
 
+from app.core.config import settings
 from app.schemas.tasks import TaskListResponse
 from app.services import governance_service
 
@@ -52,7 +53,7 @@ async def get_available_tasks(
     per_page: int = Query(
         default=20,
         ge=1,
-        le=100,
+        le=settings.TASK_PAGE_SIZE_MAX,
         description="Maximum number of tasks per page.",
     ),
 ) -> TaskListResponse:

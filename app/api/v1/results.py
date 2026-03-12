@@ -1,9 +1,9 @@
 """
 Results endpoint — GET /api/v1/results/{id}.
 
-Stub returning 501 Not Implemented until the DB persistence layer is added.
-Once DB is available this endpoint will return the stored ScoringResultResponse
-for a given submission UUID.
+Stub: raises ``NotImplementedYetError`` (→ 501 RFC 7807 response) until the
+DB persistence layer is added. Once the DB layer is in place this endpoint
+will return the stored ``ScoringResultResponse`` for the given submission UUID.
 
 References
 ----------
@@ -14,26 +14,24 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
+
+from app.core.exceptions import NotImplementedYetError
+from app.schemas.results import ScoringResultResponse
 
 router = APIRouter(tags=["results"])
 
 
 @router.get(
     "/results/{submission_id}",
+    response_model=ScoringResultResponse,
     status_code=200,
     summary="Retrieve scoring result by submission ID",
     description=(
-        "Returns the stored ScoringResultResponse for the given submission UUID. "
-        "Returns 501 Not Implemented until the DB persistence layer is added."
+        "Returns the stored ``ScoringResultResponse`` for the given submission UUID. "
+        "Requires the DB persistence layer (Phase 2)."
     ),
 )
-async def get_result(submission_id: UUID) -> None:
-    """Stub — returns 501 until the DB layer is implemented."""
-    raise HTTPException(
-        status_code=501,
-        detail=(
-            f"GET /api/v1/results/{submission_id} is not yet implemented. "
-            "The database persistence layer has not been added."
-        ),
-    )
+async def get_result(submission_id: UUID) -> ScoringResultResponse:
+    """Stub — raises NotImplementedYetError until the DB layer is implemented."""
+    raise NotImplementedYetError(f"GET /api/v1/results/{submission_id}")
