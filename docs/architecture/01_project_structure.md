@@ -25,7 +25,7 @@ winnow/
 ├── app/                            # ← Application root (Python package)
 │   ├── __init__.py
 │   ├── main.py                     # FastAPI application factory & lifespan
-│   ├── bootstrap.py                # Startup bootstrap — loads active projects into the registry
+│   ├── bootstrap.py                # Startup bootstrap — fault-tolerant auto-discovery of ProjectBuilders
 │   │
 │   ├── api/                        # Presentation layer — HTTP interface
 │   │   ├── __init__.py
@@ -111,7 +111,7 @@ winnow/
 │   │
 │   └── tests/                      # Pytest test suite (mirrors app/ structure)
 │       ├── __init__.py
-│       ├── conftest.py             # Fixtures: async test client, test DB session
+│       ├── conftest.py             # Fixtures: session-scoped bootstrap, async test client, test DB session
 │       ├── api/
 │       │   └── test_submissions.py
 │       ├── services/
@@ -210,7 +210,8 @@ The scoring pipeline (Stages 1 → 2 → 4-input) runs synchronously on submissi
 | Concern | Detail |
 |---|---|
 | **Role** | Auto-discovers and loads all active `ProjectBuilder` instances at application startup using `pkgutil`, `importlib`, and `inspect`. Scans every module in `app.registry.projects`, finds concrete `ProjectBuilder` subclasses, and calls `registry.load(builder)` for each. |
-| **Usage** | Called once from the FastAPI `lifespan` handler in `main.py`. Auto-executes on import so tests work without an explicit call. |
+| **Usage** | Must be **explicitly called** — does **not** execute on import. In production, call `bootstrap()` inside the FastAPI `lifespan` context manager in `main.py`. In tests, call it once via a session-scoped `autouse` fixture in `conftest.py`. |
+| **Fault-tolerance** | Every module import and every `registry.load()` call is individually wrapped in `try/except`. A broken or misconfigured project builder is logged and skipped; all remaining projects continue to load. A single bad file can never crash the entire application. |
 | **Rule** | Adding a new project = create `app/registry/projects/<name>.py` with a `ProjectBuilder` subclass. `bootstrap.py` requires **no changes**. See `02_architecture_patterns.md § 3b` for the full auto-discovery flow. |
 
 ### `app/scoring/` — Domain Layer (Scoring Core)

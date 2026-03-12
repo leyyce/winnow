@@ -1,10 +1,10 @@
 """
 Application bootstrap — initializes the registry via auto-discovery.
 
-Call ``bootstrap()`` once at application startup (e.g. from ``app/main.py``
-or a FastAPI ``lifespan`` handler). It is intentionally idempotent: calling it
-multiple times (e.g. during tests) is safe because ``_Registry.load`` simply
-overwrites the existing entry for a given project_id.
+Call ``bootstrap()`` exactly once at application startup (e.g. from the
+FastAPI ``lifespan`` handler in ``app/main.py``).  It is intentionally
+idempotent: calling it multiple times (e.g. during tests) is safe because
+``_Registry.load`` simply overwrites the existing entry for a given project_id.
 
 Auto-Discovery
 --------------
@@ -17,6 +17,13 @@ package using :mod:`pkgutil` and :mod:`importlib`.  Any class found that:
 is automatically instantiated (zero-argument constructor) and loaded into the
 registry.
 
+Error isolation
+---------------
+A badly-formatted or broken project module will be skipped with a logged
+warning rather than crashing the entire application.  Each module import and
+each registry load is wrapped individually so that one bad project never
+prevents the remaining projects from loading.
+
 Adding a new project
 --------------------
 1. Create ``app/registry/projects/<your_project>.py`` with a ``ProjectBuilder``
@@ -27,11 +34,14 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import logging
 import pkgutil
 
 import app.registry.projects as _projects_pkg
 from app.registry.base import ProjectBuilder
 from app.registry.manager import registry
+
+logger = logging.getLogger(__name__)
 
 
 def bootstrap() -> None:
@@ -40,17 +50,28 @@ def bootstrap() -> None:
         path=_projects_pkg.__path__,
         prefix=_projects_pkg.__name__ + ".",
     ):
-        module = importlib.import_module(module_info.name)
+        try:
+            module = importlib.import_module(module_info.name)
+        except Exception:
+            logger.warning(
+                "bootstrap: failed to import project module %r — skipping.",
+                module_info.name,
+                exc_info=True,
+            )
+            continue
+
         for _, obj in inspect.getmembers(module, inspect.isclass):
             if (
                 issubclass(obj, ProjectBuilder)
                 and obj is not ProjectBuilder
                 and obj.__module__ == module.__name__  # defined here, not re-imported
             ):
-                registry.load(obj())
-
-
-# ── Auto-bootstrap on import so that tests and services work without
-#    explicitly calling bootstrap().  Production code should call it
-#    explicitly inside the FastAPI lifespan handler for clarity.
-bootstrap()
+                try:
+                    registry.load(obj())
+                except Exception:
+                    logger.warning(
+                        "bootstrap: failed to load project builder %r from %r — skipping.",
+                        obj.__name__,
+                        module_info.name,
+                        exc_info=True,
+                    )

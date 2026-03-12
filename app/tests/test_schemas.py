@@ -257,6 +257,19 @@ class TestThresholdConfig:
         tc = ThresholdConfig.model_validate(dict(approve=100.0, review=0.0, reject=0.0))
         assert tc.approve == 100.0
 
+    def test_approve_below_review_raises(self):
+        with pytest.raises(ValidationError, match="'approve' threshold"):
+            ThresholdConfig.model_validate(dict(approve=40.0, review=50.0, reject=20.0))
+
+    def test_review_below_reject_raises(self):
+        with pytest.raises(ValidationError, match="'review' threshold"):
+            ThresholdConfig.model_validate(dict(approve=80.0, review=30.0, reject=50.0))
+
+    def test_equal_thresholds_accepted(self):
+        # approve == review == reject is a degenerate but logically valid config
+        tc = ThresholdConfig.model_validate(dict(approve=50.0, review=50.0, reject=50.0))
+        assert tc.approve == tc.review == tc.reject == 50.0
+
 
 # ── RequiredValidations ────────────────────────────────────────────────────────
 

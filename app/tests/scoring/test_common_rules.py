@@ -25,7 +25,6 @@ from app.scoring.common.trust_advisor import (
 )
 from app.scoring.common.trust_level import TrustLevelRule
 from app.registry.manager import registry
-import app.bootstrap  # ensure registry is populated
 
 
 # ── Shared helpers ────────────────────────────────────────────────────────────

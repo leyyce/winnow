@@ -62,7 +62,7 @@ graph LR
 |---|---|
 | `app/scoring/projects/trees/` | ✅ Yes — this is the designated place. |
 | `app/scoring/common/` | ❌ No — only generic scoring factors (e.g., trust level, Trust Advisor). |
-| `app/scoring/base.py` | ❌ No — abstract `ScoringRule` interface only. |
+| `app/scoring/base.py` | ❌ No — abstract `ScoringRule[P]` Generic interface only (Template Method pattern). |
 | `app/services/scoring_service.py` | ❌ No — works with `ScoringRule` abstraction. |
 | `app/schemas/envelope.py` | ❌ No — payload is `dict[str, Any]`. |
 | `app/schemas/projects/trees.py` | ✅ Yes — isolated payload schema. |
@@ -141,7 +141,7 @@ flowchart LR
         P1B["Synchronous scoring"]
         P1C["Single Docker Compose stack"]
         P1D["API key auth"]
-        P1E["5 tree-specific rules"]
+        P1E["5 scoring rules (4 tree-specific + 1 common trust rule)"]
     end
 
     subgraph "Phase 2 — Post-Thesis"

@@ -23,7 +23,7 @@ from app.schemas.envelope import UserContext
 from app.scoring.base import RuleResult, ScoringRule
 
 
-class TrustLevelRule(ScoringRule):
+class TrustLevelRule(ScoringRule[BaseModel]):
     """
     Normalises the submitter's trust level into a score using a piecewise-linear
     function. All parameters are injected from project registry configuration.
@@ -52,7 +52,11 @@ class TrustLevelRule(ScoringRule):
     def weight(self) -> float:
         return self._weight
 
-    def evaluate(self, payload: BaseModel, context: UserContext) -> RuleResult:
+    @property
+    def payload_type(self) -> type[BaseModel]:
+        return BaseModel
+
+    def _evaluate(self, payload: BaseModel, context: UserContext) -> RuleResult:
         tl = context.trust_level
 
         if tl <= self._trust_level_mid:

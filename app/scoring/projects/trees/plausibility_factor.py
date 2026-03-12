@@ -16,14 +16,12 @@ Laravel owns species data (Rule 5: Domain Ownership). Sensitivity parameters
 """
 from __future__ import annotations
 
-from pydantic import BaseModel
-
 from app.schemas.envelope import UserContext
 from app.schemas.projects.trees import TreePayload
 from app.scoring.base import RuleResult, ScoringRule
 
 
-class PlausibilityFactorRule(ScoringRule):
+class PlausibilityFactorRule(ScoringRule[TreePayload]):
     """
     Computes the plausibility score for a tree measurement relative to the
     species' historical distribution. Sensitivity parameters are injected
@@ -51,6 +49,10 @@ class PlausibilityFactorRule(ScoringRule):
     def weight(self) -> float:
         return self._weight
 
+    @property
+    def payload_type(self) -> type[TreePayload]:
+        return TreePayload
+
     @staticmethod
     def _normalised_deviation(value: float, mean: float, std: float) -> float:
         """Return |value − mean| / std, or 0.0 when std ≤ 0 (insufficient data)."""
@@ -58,18 +60,13 @@ class PlausibilityFactorRule(ScoringRule):
             return 0.0
         return abs(value - mean) / std
 
-    def evaluate(self, payload: BaseModel, context: UserContext) -> RuleResult:
-        assert isinstance(payload, TreePayload), f"Expected TreePayload, got {type(payload)}"
-
+    def _evaluate(self, payload: TreePayload, context: UserContext) -> RuleResult:
         m = payload.measurement
         s = payload.species_stats
-
         d_h = self._normalised_deviation(m.height, s.mean_height, s.std_height)
         d_i = self._normalised_deviation(float(m.inclination), s.mean_inclination, s.std_inclination)
         d_d = self._normalised_deviation(float(m.trunk_diameter), s.mean_trunk_diameter, s.std_trunk_diameter)
-
         score = max(0.0, 1.0 - (self._alpha_h * d_h + self._alpha_i * d_i + self._alpha_d * d_d))
-
         return RuleResult(
             rule_name=self.name,
             score=score,

@@ -16,7 +16,7 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class RuleBreakdown(BaseModel):
@@ -53,6 +53,8 @@ class ThresholdConfig(BaseModel):
     These are advisory values — the client uses them to route the submission
     (auto-approve / queue for review / auto-reject) without hard-coding thresholds
     on its own side. Winnow advises; the client decides.
+
+    Cross-field constraint: ``approve >= review >= reject``.
     """
 
     approve: float = Field(
@@ -70,6 +72,21 @@ class ThresholdConfig(BaseModel):
         le=100.0,
         description="Scores below this value may be auto-rejected by the client.",
     )
+
+    @model_validator(mode="after")
+    def _thresholds_ordered(self) -> "ThresholdConfig":
+        """Enforce approve >= review >= reject to prevent nonsensical routing."""
+        if self.approve < self.review:
+            raise ValueError(
+                f"'approve' threshold ({self.approve}) must be >= "
+                f"'review' threshold ({self.review})"
+            )
+        if self.review < self.reject:
+            raise ValueError(
+                f"'review' threshold ({self.review}) must be >= "
+                f"'reject' threshold ({self.reject})"
+            )
+        return self
 
 
 class RequiredValidations(BaseModel):

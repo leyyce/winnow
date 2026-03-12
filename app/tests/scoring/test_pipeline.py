@@ -41,8 +41,8 @@ class DummyPayload(BaseModel):
     value: float = 1.0
 
 
-class FixedRule(ScoringRule):
-    """A stub rule that always returns a fixed score."""
+class FixedRule(ScoringRule[BaseModel]):
+    """A stub rule that always returns a fixed score. Accepts any BaseModel payload."""
 
     def __init__(self, name: str, weight: float, fixed_score: float, details: str | None = None):
         self._name = name
@@ -58,7 +58,11 @@ class FixedRule(ScoringRule):
     def weight(self) -> float:
         return self._weight
 
-    def evaluate(self, payload: BaseModel, context: UserContext) -> RuleResult:
+    @property
+    def payload_type(self) -> type[BaseModel]:
+        return BaseModel
+
+    def _evaluate(self, payload: BaseModel, context: UserContext) -> RuleResult:
         return RuleResult(rule_name=self._name, score=self._score, details=self._details)
 
 
@@ -112,13 +116,13 @@ class TestEmptyPipeline:
 
 class TestSingleRulePipeline:
     def test_full_score_single_rule(self):
-        # score=1.0, weight=0.4 → total = 1.0 × 0.4 × 100 = 40.0
-        pipeline = ScoringPipeline([FixedRule("r1", weight=0.4, fixed_score=1.0)])
+        # score=1.0, weight=1.0 → total = 1.0 × 1.0 × 100 = 100.0
+        pipeline = ScoringPipeline([FixedRule("r1", weight=1.0, fixed_score=1.0)])
         result = pipeline.run(DummyPayload(), _ctx())
-        assert result.total_score == pytest.approx(40.0)
+        assert result.total_score == pytest.approx(100.0)
 
     def test_zero_score_single_rule(self):
-        pipeline = ScoringPipeline([FixedRule("r1", weight=0.4, fixed_score=0.0)])
+        pipeline = ScoringPipeline([FixedRule("r1", weight=1.0, fixed_score=0.0)])
         result = pipeline.run(DummyPayload(), _ctx())
         assert result.total_score == pytest.approx(0.0)
 
@@ -206,9 +210,9 @@ class TestMultiRulePipeline:
 
 class TestPipelineRounding:
     def test_result_rounded_to_four_decimal_places(self):
-        # 1/3 × 1/3 × 100 ≈ 11.1111…  → rounded to 4 dp = 11.1111
+        # score=1/3, weight=1.0 → 1/3 × 1.0 × 100 ≈ 33.3333…  → rounded to 4 dp
         pipeline = ScoringPipeline([
-            FixedRule("r", weight=round(1 / 3, 10), fixed_score=round(1 / 3, 10)),
+            FixedRule("r", weight=1.0, fixed_score=round(1 / 3, 10)),
         ])
         result = pipeline.run(DummyPayload(), _ctx())
         # Verify no more than 4 decimal places in representation
@@ -217,9 +221,46 @@ class TestPipelineRounding:
             assert len(decimal_part[1]) <= 4
 
     def test_exact_integer_result_has_no_extra_decimals(self):
-        pipeline = ScoringPipeline([FixedRule("r", weight=0.5, fixed_score=0.5)])
+        # score=0.25, weight=1.0 → 0.25 × 1.0 × 100 = 25.0
+        pipeline = ScoringPipeline([FixedRule("r", weight=1.0, fixed_score=0.25)])
         result = pipeline.run(DummyPayload(), _ctx())
         assert result.total_score == pytest.approx(25.0)
+
+
+# ── ScoringPipeline — weight validation ──────────────────────────────────────
+
+class TestPipelineWeightValidation:
+    def test_weights_not_summing_to_one_raises(self):
+        with pytest.raises(ValueError, match="weights must sum to 1.0"):
+            ScoringPipeline([
+                FixedRule("r1", weight=0.4, fixed_score=1.0),
+                FixedRule("r2", weight=0.4, fixed_score=1.0),
+            ])
+
+    def test_single_rule_weight_not_one_raises(self):
+        with pytest.raises(ValueError, match="weights must sum to 1.0"):
+            ScoringPipeline([FixedRule("r", weight=0.5, fixed_score=1.0)])
+
+    def test_empty_pipeline_does_not_raise(self):
+        # Empty pipelines are exempt — no weights to sum
+        pipeline = ScoringPipeline([])
+        assert pipeline.run(DummyPayload(), _ctx()).total_score == 0.0
+
+    def test_weights_summing_to_one_accepted(self):
+        pipeline = ScoringPipeline([
+            FixedRule("r1", weight=0.3, fixed_score=1.0),
+            FixedRule("r2", weight=0.7, fixed_score=1.0),
+        ])
+        assert pipeline.run(DummyPayload(), _ctx()).total_score == pytest.approx(100.0)
+
+    def test_floating_point_weight_sum_within_tolerance_accepted(self):
+        # 0.1 + 0.2 + 0.7 may not be exactly 1.0 in IEEE 754, but is within tolerance
+        pipeline = ScoringPipeline([
+            FixedRule("r1", weight=0.1, fixed_score=1.0),
+            FixedRule("r2", weight=0.2, fixed_score=1.0),
+            FixedRule("r3", weight=0.7, fixed_score=1.0),
+        ])
+        assert pipeline.run(DummyPayload(), _ctx()).total_score == pytest.approx(100.0)
 
 
 # ── ScoringPipeline — payload and context pass-through ────────────────────────
@@ -228,7 +269,7 @@ class TestPipelinePassThrough:
     def test_payload_passed_to_rule(self):
         received: list = []
 
-        class CapturingRule(ScoringRule):
+        class CapturingRule(ScoringRule[BaseModel]):
             @property
             def name(self) -> str:
                 return "capture"
@@ -237,7 +278,11 @@ class TestPipelinePassThrough:
             def weight(self) -> float:
                 return 1.0
 
-            def evaluate(self, payload: BaseModel, context: UserContext) -> RuleResult:
+            @property
+            def payload_type(self) -> type[BaseModel]:
+                return BaseModel
+
+            def _evaluate(self, payload: BaseModel, context: UserContext) -> RuleResult:
                 received.append(payload)
                 return RuleResult(rule_name="capture", score=1.0)
 
@@ -248,7 +293,7 @@ class TestPipelinePassThrough:
     def test_context_passed_to_rule(self):
         received: list = []
 
-        class CapturingRule(ScoringRule):
+        class CapturingRule(ScoringRule[BaseModel]):
             @property
             def name(self) -> str:
                 return "capture"
@@ -257,7 +302,11 @@ class TestPipelinePassThrough:
             def weight(self) -> float:
                 return 1.0
 
-            def evaluate(self, payload: BaseModel, context: UserContext) -> RuleResult:
+            @property
+            def payload_type(self) -> type[BaseModel]:
+                return BaseModel
+
+            def _evaluate(self, payload: BaseModel, context: UserContext) -> RuleResult:
                 received.append(context)
                 return RuleResult(rule_name="capture", score=1.0)
 

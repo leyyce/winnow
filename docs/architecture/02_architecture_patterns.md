@@ -30,12 +30,16 @@ The **Strategy Pattern** is the architectural backbone of Winnow. Each scoring f
 
 ```mermaid
 classDiagram
-    class ScoringRule {
-        <<abstract>>
+    class ScoringRule~P~ {
+        <<abstract, Generic[P]>>
         +name: str
         +weight: float
+        +payload_type: type~P~
         +evaluate(payload: BaseModel, context: UserContext) RuleResult
+        #_evaluate(payload: P, context: UserContext) RuleResult
     }
+
+    note for ScoringRule "evaluate() is the public entry point.\nIt performs isinstance(payload, payload_type)\nand delegates to _evaluate().\nSubclasses implement _evaluate() only."
 
     class RuleResult {
         +rule_name: str
@@ -44,29 +48,34 @@ classDiagram
     }
 
     class TrustLevelRule {
+        +payload_type: type~BaseModel~
         +max_trust_level: int
-        +evaluate(payload, context) RuleResult
+        #_evaluate(payload, context) RuleResult
     }
 
     note for TrustLevelRule "Stage 4 input: uses\ntrust_level from the wire"
 
     class HeightFactorRule {
+        +payload_type: type~TreePayload~
         +h_max: float
-        +evaluate(payload, context) RuleResult
+        #_evaluate(payload, context) RuleResult
     }
 
     class DistanceFactorRule {
-        +evaluate(payload, context) RuleResult
+        +payload_type: type~TreePayload~
+        #_evaluate(payload, context) RuleResult
     }
 
     class PlausibilityFactorRule {
+        +payload_type: type~TreePayload~
         +species_params: dict
-        +evaluate(payload, context) RuleResult
+        #_evaluate(payload, context) RuleResult
     }
 
     class CommentFactorRule {
+        +payload_type: type~TreePayload~
         +penalty: float
-        +evaluate(payload, context) RuleResult
+        #_evaluate(payload, context) RuleResult
     }
 
     ScoringRule <|-- TrustLevelRule : implements
@@ -82,6 +91,8 @@ classDiagram
         +run(payload: BaseModel, context: UserContext) ScoringResult
     }
 
+    note for ScoringPipeline "Validates sum(weights) == 1.0 at\nconstruction time (math.isclose, tol=1e-6).\nRaises ValueError if misconfigured."
+
     ScoringPipeline o-- ScoringRule : iterates over
 ```
 
@@ -91,20 +102,32 @@ classDiagram
 
 ### How It Works
 
-1. Every scoring rule implements `evaluate(payload, context) → RuleResult`.
-2. The `payload` parameter is a **validated Pydantic model instance** (e.g., `TreePayload`), not a raw dict. This is guaranteed because Stage 1 validation runs first.
+`ScoringRule` implements the **Template Method Pattern**. The base class owns the public `evaluate()` method; concrete rules implement the protected `_evaluate()` method.
+
+1. **`evaluate(payload, context)` — the public entry point (base class, do not override).** It verifies that `isinstance(payload, self.payload_type)` and raises a `TypeError` if the wrong payload type is passed. It then delegates to `_evaluate()`. This centralises runtime type safety across all rules, eliminating the need for per-rule `assert isinstance` guards.
+2. **`_evaluate(payload: P, context)` — the abstract hook (subclass responsibility).** Receives a payload already confirmed to be of type `P` and returns a `RuleResult`. The payload is a **validated Pydantic model instance** (e.g., `TreePayload`), not a raw dict — Stage 1 validation is guaranteed to have run first.
 3. `RuleResult` contains a normalised `score ∈ [0, 1]` and an optional human-readable `details` string.
-4. The `ScoringPipeline` collects all `RuleResult` objects, multiplies each by its `weight`, sums them, and produces the final **Confidence Score (CS)**.
+4. The `ScoringPipeline` collects all `RuleResult` objects, multiplies each by its `weight`, sums them, and produces the final **Confidence Score (CS)**. The pipeline verifies `∑weights = 1.0` at construction time (see [Strict Weight Validation](#strict-weight-validation) below).
 
 ### Adding a New Rule
 
 To add a scoring rule for a new project (e.g., a biodiversity observation app):
 
 1. Create `app/scoring/projects/biodiversity/observation_plausibility.py`.
-2. Implement `ScoringRule.evaluate(...)`.
-3. Register it in the project's `ProjectBuilder.build()` method (e.g., `app/registry/projects/biodiversity.py`).
+2. Subclass `ScoringRule[YourPayloadType]`, specifying the concrete payload type as the generic parameter.
+3. Define the `payload_type` property returning the same concrete type (e.g., `return ObservationPayload`). The base class uses this at runtime to enforce type safety in `evaluate()`.
+4. Implement `_evaluate(self, payload: YourPayloadType, context: UserContext) → RuleResult` with your scoring logic. Do **not** override `evaluate()` — type checking is handled for you.
+5. Register the rule instance in the project's `ProjectBuilder.build()` method (e.g., `app/registry/projects/biodiversity.py`), providing its configured `weight`.
 
 **No existing code needs to change — including `bootstrap.py`.** The auto-discovery mechanism (see [Section 3b](#3b-bootstrap-pattern--auto-discovery)) picks up the new builder automatically. This is the [Open/Closed Principle](https://en.wikipedia.org/wiki/Open%E2%80%93closed_principle) in action.
+
+### Strict Weight Validation
+
+The `ScoringPipeline` enforces a critical mathematical invariant at construction time:
+
+$$\sum_{i} w_i = 1.0$$
+
+If the weights of the provided rules do not sum to `1.0` (checked with `math.isclose`, tolerance `1e-6`), the pipeline raises a `ValueError` immediately — before any submission is processed. This guarantees that the Confidence Score is always a true weighted average and can never silently exceed 100 due to misconfiguration in a `ProjectBuilder`. Empty pipelines (zero rules) are exempt from this check.
 
 ---
 
@@ -282,31 +305,50 @@ No changes to `bootstrap.py`, `registry/manager.py`, or any other infrastructure
 
 ### Integration with FastAPI
 
-`app/bootstrap.py` is imported by `app/main.py` inside the FastAPI `lifespan` context, ensuring the registry is fully populated before the first request is served. For tests, importing `app.bootstrap` at the top of the test file (or in `conftest.py`) is sufficient.
+`bootstrap()` must be **explicitly called** — it does **not** execute on import. The canonical integration points are:
+
+- **Production:** call `bootstrap()` inside the FastAPI `lifespan` async context manager in `main.py`, before the application begins serving requests.
+- **Tests:** call `bootstrap()` once via a session-scoped `autouse` fixture in `conftest.py`. This ensures the registry is populated for all tests without duplicating setup.
+
+This design prevents import-time side effects: a syntax error or misconfiguration in any project builder file cannot crash the application or contaminate unrelated test modules.
+
+### Fault-Tolerant Loading
+
+Each module import and each `registry.load()` call is individually wrapped in `try/except`. If a project builder raises any exception during discovery (e.g., a missing dependency, a bad configuration value, a `ValueError` from weight validation), Winnow logs a structured error for that project and **continues loading all remaining projects**. A single broken project file never prevents the rest of the application from starting.
 
 ```python
 # Conceptual pseudo-code — NOT implementation
 
-import pkgutil, importlib, inspect
+import pkgutil, importlib, inspect, logging
 from app.registry.base import ProjectBuilder
 from app.registry.manager import registry
 import app.registry.projects as _projects_pkg
 
-def _discover_and_load() -> None:
+logger = logging.getLogger(__name__)
+
+def bootstrap() -> None:
+    """Discover and load all ProjectBuilder subclasses. Call explicitly from
+    the FastAPI lifespan handler or a test fixture — never on import."""
     for finder, module_name, _ in pkgutil.walk_packages(
         path=_projects_pkg.__path__,
         prefix=_projects_pkg.__name__ + ".",
     ):
-        module = importlib.import_module(module_name)
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            logger.exception("Failed to import project module %s — skipping", module_name)
+            continue
+
         for _, obj in inspect.getmembers(module, inspect.isclass):
             if (
                 issubclass(obj, ProjectBuilder)
                 and obj is not ProjectBuilder
                 and obj.__module__ == module.__name__  # defined here, not re-imported
             ):
-                registry.load(obj())
-
-_discover_and_load()
+                try:
+                    registry.load(obj())
+                except Exception:
+                    logger.exception("Failed to load builder %s — skipping", obj.__name__)
 ```
 
 ---
@@ -411,6 +453,14 @@ The Confidence Score is included in the initial response to **help the client de
 | **< lower threshold** (e.g., 50) | Client may auto-reject; submitter notified. |
 
 Thresholds are **per-project** and stored in the registry/config. This allows each Citizen Science project to tune its own tolerance. **Winnow advises; the client decides.**
+
+### ThresholdConfig Cross-Field Validation
+
+`ThresholdConfig` enforces a cross-field semantic constraint via a `@model_validator(mode="after")`:
+
+$$approve \geq review \geq reject$$
+
+A configuration where, for example, `approve=20, review=80, reject=90` would be logically nonsensical (the auto-approval bar would be lower than the rejection bar). Pydantic raises a `ValueError` at model construction time if this ordering is violated, preventing silent governance corruption. Each value is still independently constrained to `[0, 100]`.
 
 ---
 

@@ -1,8 +1,12 @@
 """
 Abstract base classes for the Strategy Pattern backbone of Winnow's scoring layer.
 
-Every scoring factor (Hₙ, Aₙ, Pₙ, Kₙ, Tₙ) implements ScoringRule.evaluate()
-and is instantiated with project-specific configuration at registry build time.
+Every scoring factor (Hₙ, Aₙ, Pₙ, Kₙ, Tₙ) implements ScoringRule[P] where P is
+the project-specific Pydantic payload type.  The concrete ``evaluate()`` method on
+the base class performs a centralised runtime type check (replacing per-rule
+``assert isinstance`` statements) and then delegates to the abstract ``_evaluate()``
+which carries the correct static type signature.
+
 No numeric values live inside rule implementations — all parameters are injected
 from the registry (Rule 3: Configuration is King).
 """
@@ -10,10 +14,13 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Generic, TypeVar
 
 from pydantic import BaseModel
 
 from app.schemas.envelope import UserContext
+
+P = TypeVar("P", bound=BaseModel)
 
 
 @dataclass(frozen=True)
@@ -25,13 +32,15 @@ class RuleResult:
     details: str | None = None
 
 
-class ScoringRule(ABC):
+class ScoringRule(ABC, Generic[P]):
     """
-    Abstract scoring strategy.
+    Abstract scoring strategy, generic over payload type P.
 
-    Each concrete rule encapsulates one scoring factor. Rules receive a
-    *validated* Pydantic payload (Stage 1 has already passed) and the
-    UserContext from the wire, and return a normalised RuleResult ∈ [0, 1].
+    Each concrete rule declares its expected payload type via the ``payload_type``
+    property.  The base ``evaluate()`` method enforces that contract at runtime:
+    if the wrong payload type is supplied it raises ``TypeError`` immediately,
+    before any rule logic runs.  Concrete rules implement ``_evaluate()`` with a
+    fully-typed P signature — no per-rule ``isinstance`` guards are needed.
 
     Weights and all numeric parameters must be injected via __init__ from
     the project's registry configuration — never hardcoded inside the rule.
@@ -47,6 +56,25 @@ class ScoringRule(ABC):
     def weight(self) -> float:
         """Fractional contribution weight in the pipeline (0–1)."""
 
+    @property
     @abstractmethod
+    def payload_type(self) -> type[P]:
+        """The concrete Pydantic model class this rule expects as its payload."""
+
     def evaluate(self, payload: BaseModel, context: UserContext) -> RuleResult:
-        """Evaluate the payload and return a normalised RuleResult."""
+        """
+        Type-check *payload* against ``payload_type``, then delegate to
+        ``_evaluate``.  Raises ``TypeError`` for mismatched payloads so that
+        integration errors surface as controlled exceptions rather than silent
+        ``AttributeError`` crashes.
+        """
+        if not isinstance(payload, self.payload_type):
+            raise TypeError(
+                f"{self.__class__.__name__} expected "
+                f"{self.payload_type.__name__}, got {type(payload).__name__}"
+            )
+        return self._evaluate(payload, context)  # type: ignore[arg-type]
+
+    @abstractmethod
+    def _evaluate(self, payload: P, context: UserContext) -> RuleResult:
+        """Evaluate the payload and return a normalised RuleResult ∈ [0, 1]."""

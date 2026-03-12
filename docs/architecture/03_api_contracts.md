@@ -49,45 +49,32 @@ Content-Type: application/json
     "account_created_at": "2025-01-15T10:00:00Z"
   },
   "payload": {
-    "tree": {
-      "tree_id": "b8f9e0d1-2a3b-4c5d-6e7f-8a9b0c1d2e3f",
-      "species_id": "c1d2e3f4-5a6b-7c8d-9e0f-1a2b3c4d5e6f",
-      "species_name": "Quercus robur",
-      "condition": "healthy",
-      "location": {
-        "latitude": 50.5558,
-        "longitude": 9.6808
-      },
-      "location_confidence": "measured"
-    },
+    "tree_id": "b8f9e0d1-2a3b-4c5d-6e7f-8a9b0c1d2e3f",
+    "species_id": "c1d2e3f4-5a6b-7c8d-9e0f-1a2b3c4d5e6f",
     "measurement": {
       "height": 18.5,
       "trunk_diameter": 45,
       "inclination": 5,
-      "distance_to_tree": 20.0,
-      "distance_measured": true,
       "note": null
     },
+    "step_length_measured": true,
     "photos": [
       {
-        "photo_id": "d4e5f6a7-b8c9-0d1e-2f3a-4b5c6d7e8f90",
-        "type": "side_view",
-        "url": "https://tree-app.example.com/photos/abc123.jpg"
+        "path": "photos/abc123.jpg",
+        "note": null
       },
       {
-        "photo_id": "e5f6a7b8-c9d0-1e2f-3a4b-5c6d7e8f9a01",
-        "type": "angle_45",
-        "url": "https://tree-app.example.com/photos/def456.jpg"
+        "path": "photos/def456.jpg",
+        "note": null
       }
     ],
-    "species_reference": {
-      "a": 0.5,
-      "b": 1.2,
-      "c": 0.8,
-      "d": null,
-      "e": null,
-      "f": null,
-      "g": null
+    "species_stats": {
+      "mean_height": 20.0,
+      "std_height": 5.0,
+      "mean_inclination": 3.0,
+      "std_inclination": 2.0,
+      "mean_trunk_diameter": 50.0,
+      "std_trunk_diameter": 10.0
     }
   }
 }
@@ -161,47 +148,46 @@ class SubmissionEnvelope(BaseModel):
 ```python
 # app/schemas/projects/trees.py  (conceptual)
 
-class TreeLocation(BaseModel):
-    latitude: float = Field(ge=-90, le=90)
-    longitude: float = Field(ge=-180, le=180)
+class TreePhotoPayload(BaseModel):
+    path: str = Field(min_length=1)       # relative or absolute path/URL to stored photo
+    note: str | None = None               # optional free-text note for this photo
 
-class TreeInfo(BaseModel):
-    tree_id: UUID | None = None           # None when registering a new tree
-    species_id: UUID
-    species_name: str | None = None
-    condition: Literal["healthy", "damaged", "diseased", "dead"]
-    location: TreeLocation
-    location_confidence: Literal["measured", "estimated", "unknown"]
-
-class TreeMeasurement(BaseModel):
-    height: float = Field(gt=0, le=150)   # metres; 150 as absolute sanity cap
-    trunk_diameter: int = Field(gt=0)     # mm
-    inclination: int = Field(ge=0, le=90) # degrees
-    distance_to_tree: float = Field(gt=0) # metres
-    distance_measured: bool               # True = measured step length, False = estimated
+class TreeMeasurementPayload(BaseModel):
+    height: float = Field(gt=0)           # metres (must be positive; no upper cap — governed by scoring)
+    trunk_diameter: int = Field(gt=0)     # centimetres (DBH)
+    inclination: int = Field(ge=0, le=90) # degrees from vertical
     note: str | None = None
 
-class TreePhoto(BaseModel):
-    photo_id: UUID
-    type: Literal["side_view", "angle_45"]
-    url: HttpUrl
-
-class SpeciesReference(BaseModel):
-    """Allometric coefficients from the tree_species table (a–g)."""
-    a: float | None = None
-    b: float | None = None
-    c: float | None = None
-    d: float | None = None
-    e: float | None = None
-    f: float | None = None
-    g: float | None = None
+class SpeciesStats(BaseModel):
+    """Historical species statistics forwarded by the client for Pₙ scoring.
+    Winnow is stateless w.r.t. species data — Laravel supplies μ/σ per submission."""
+    mean_height: float = Field(gt=0)
+    std_height: float = Field(ge=0)
+    mean_inclination: float = Field(ge=0, le=90)
+    std_inclination: float = Field(ge=0)
+    mean_trunk_diameter: float = Field(gt=0)
+    std_trunk_diameter: float = Field(ge=0)
 
 class TreePayload(BaseModel):
-    tree: TreeInfo
-    measurement: TreeMeasurement
-    photos: list[TreePhoto] = Field(min_length=2)
-    species_reference: SpeciesReference | None = None
+    tree_id: UUID
+    species_id: UUID
+    measurement: TreeMeasurementPayload
+    photos: list[TreePhotoPayload] = Field(min_length=2)  # ≥ 2 photos required
+    step_length_measured: bool          # True = physically measured; False = estimated (Aₙ input)
+    species_stats: SpeciesStats         # mandatory — required for Pₙ plausibility scoring
+
+    @model_validator(mode="after")
+    def photos_have_unique_paths(self) -> "TreePayload":
+        """Guard: no duplicate photo paths within one submission."""
+        ...
 ```
+
+> **Key design notes vs. earlier drafts:**
+> - The payload is **flat** — `tree_id` and `species_id` sit directly on `TreePayload`, not inside a nested `TreeInfo` sub-object. Fields like `condition`, `location`, and `location_confidence` belong to Laravel's domain data and are not forwarded to Winnow.
+> - `trunk_diameter` is in **centimetres** (not mm).
+> - The distance field is `step_length_measured: bool` (was it physically measured?), not a separate `distance_to_tree` float — Winnow only needs the boolean for the Aₙ factor.
+> - Photos carry a `path` string and an optional `note`; there is no `photo_id`, `type`, or `url` field — photo identity and classification are Laravel's concern.
+> - `species_stats` (μ/σ values for height, inclination, and trunk diameter) replaces the old allometric `species_reference` (a–g coefficients). It is **required** — every submission must include species statistics for Pₙ plausibility scoring.
 
 ### Stage 1 → Stage 2 Validation Flow
 
@@ -303,15 +289,17 @@ Content-Type: application/json
 
 class RuleBreakdown(BaseModel):
     rule: str
-    weight: float
-    score: float            # normalised 0–1
-    weighted_score: float   # score × weight × 100
-    details: str | None
+    weight: float = Field(ge=0.0, le=1.0)   # fractional weight (0–1)
+    score: float = Field(ge=0.0, le=1.0)    # normalised rule output (0–1)
+    weighted_score: float = Field(ge=0.0)   # score × weight × 100
+    details: str | None = None
 
 class ThresholdConfig(BaseModel):
-    approve: float
-    review: float
-    reject: float
+    approve: float = Field(ge=0.0, le=100.0)
+    review: float = Field(ge=0.0, le=100.0)
+    reject: float = Field(ge=0.0, le=100.0)
+    # Cross-field invariant enforced by @model_validator(mode="after"):
+    # approve >= review >= reject
 
 class RequiredValidations(BaseModel):
     min_validators: int          # e.g., 1, 2, 3
@@ -323,7 +311,7 @@ class ScoringResultResponse(BaseModel):
     submission_id: UUID
     project_id: str
     status: Literal["pending_finalization", "approved", "rejected"]
-    confidence_score: float  # 0–100
+    confidence_score: float = Field(ge=0.0, le=100.0)  # 0–100
     breakdown: list[RuleBreakdown]
     required_validations: RequiredValidations
     thresholds: ThresholdConfig
@@ -607,7 +595,7 @@ GET /api/v1/results/{submission_id}
 
 ### Response
 
-Returns the `ScoringResultResponse` schema (including `required_validations`). If the submission has been finalized, the response also includes the `trust_adjustment` data.
+Returns the `ScoringResultResponse` schema (including `required_validations`) for the initial scoring data. If the submission has been finalized, use `GET /api/v1/results/{submission_id}/finalization` or check the persisted `FinalizationResponse` — the finalization response (`TrustAdjustment`, `final_status`) is a **separate schema** (`app/schemas/finalization.py`) and is not embedded inside `ScoringResultResponse`.
 
 ### List Endpoint (optional, for dashboards)
 

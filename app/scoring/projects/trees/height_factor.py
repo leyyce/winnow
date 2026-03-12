@@ -11,14 +11,12 @@ injected at construction time — never hardcoded in this module.
 """
 from __future__ import annotations
 
-from pydantic import BaseModel
-
 from app.schemas.envelope import UserContext
 from app.schemas.projects.trees import TreePayload
 from app.scoring.base import RuleResult, ScoringRule
 
 
-class HeightFactorRule(ScoringRule):
+class HeightFactorRule(ScoringRule[TreePayload]):
     """
     Normalises submitted tree height against the project-configured h_max.
     All parameters are injected from project registry configuration.
@@ -38,8 +36,11 @@ class HeightFactorRule(ScoringRule):
     def weight(self) -> float:
         return self._weight
 
-    def evaluate(self, payload: BaseModel, context: UserContext) -> RuleResult:
-        assert isinstance(payload, TreePayload), f"Expected TreePayload, got {type(payload)}"
+    @property
+    def payload_type(self) -> type[TreePayload]:
+        return TreePayload
+
+    def _evaluate(self, payload: TreePayload, context: UserContext) -> RuleResult:
         h = payload.measurement.height
         score = min(h / self._h_max, 1.0)
         return RuleResult(

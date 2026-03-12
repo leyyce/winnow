@@ -25,7 +25,6 @@ from app.schemas.projects.trees import (
 )
 from app.schemas.results import RequiredValidations
 from app.registry.manager import registry
-import app.bootstrap  # ensure registry is populated
 from app.scoring.pipeline import ScoringPipeline
 from app.scoring.projects.trees.comment_factor import CommentFactorRule
 from app.scoring.projects.trees.distance_factor import DistanceFactorRule
@@ -390,14 +389,31 @@ class TestScoringPipelineIntegration:
         assert len(result.breakdown) == 1
 
     def test_zero_weight_rule_contributes_nothing(self):
-        rules = [HeightFactorRule(weight=0.0, h_max=72.0)]
+        # A zero-weight rule paired with a full-weight rule: only the latter
+        # contributes. Pipeline weights still sum to 1.0 (0.0 + 1.0).
+        rules = [
+            HeightFactorRule(weight=0.0, h_max=72.0),
+            DistanceFactorRule(weight=1.0, measured_score=0.5, estimated_score=0.5),
+        ]
         result = ScoringPipeline(rules).run(_payload(height=72.0), _ctx())
-        assert result.total_score == pytest.approx(0.0)
+        # height rule contributes 0, distance rule contributes 0.5 × 1.0 × 100 = 50
+        assert result.total_score == pytest.approx(50.0)
 
     def test_empty_pipeline_gives_zero(self):
+        # Empty pipelines are exempt from the weight-sum constraint
         result = ScoringPipeline([]).run(_payload(), _ctx())
         assert result.total_score == pytest.approx(0.0)
         assert result.breakdown == []
+
+    def test_wrong_payload_type_raises_type_error(self):
+        from pydantic import BaseModel
+
+        class OtherPayload(BaseModel):
+            value: float = 1.0
+
+        rule = HeightFactorRule(weight=1.0, h_max=72.0)
+        with pytest.raises(TypeError, match="HeightFactorRule expected TreePayload"):
+            rule.evaluate(OtherPayload(), _ctx())
 
     def test_full_five_rule_pipeline_within_range(self):
         entry = registry.get_config("tree-app")

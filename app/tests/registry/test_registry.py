@@ -16,7 +16,6 @@ from app.schemas.projects.trees import TreePayload
 from app.scoring.common.trust_advisor import TrustAdvisor
 from app.scoring.pipeline import ScoringPipeline
 from app.governance.projects.trees import TreeGovernancePolicy
-import app.bootstrap  # ensure registry is populated via auto-discovery
 
 
 # ── Bootstrap ──────────────────────────────────────────────────────────────────

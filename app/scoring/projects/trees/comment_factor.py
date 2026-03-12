@@ -13,14 +13,12 @@ Penalty magnitudes are project-specific and injected at construction time.
 """
 from __future__ import annotations
 
-from pydantic import BaseModel
-
 from app.schemas.envelope import UserContext
 from app.schemas.projects.trees import TreePayload
 from app.scoring.base import RuleResult, ScoringRule
 
 
-class CommentFactorRule(ScoringRule):
+class CommentFactorRule(ScoringRule[TreePayload]):
     """
     Reduces the score when submitter-supplied comments indicate uncertainty.
     All penalty values are injected from project registry configuration.
@@ -49,15 +47,15 @@ class CommentFactorRule(ScoringRule):
     def weight(self) -> float:
         return self._weight
 
-    def evaluate(self, payload: BaseModel, context: UserContext) -> RuleResult:
-        assert isinstance(payload, TreePayload), f"Expected TreePayload, got {type(payload)}"
+    @property
+    def payload_type(self) -> type[TreePayload]:
+        return TreePayload
 
+    def _evaluate(self, payload: TreePayload, context: UserContext) -> RuleResult:
         i_mess = 1 if payload.measurement.note else 0
         n_mand = sum(1 for p in payload.photos if p.note)
-
         p_sum = i_mess * self._measurement_penalty + n_mand * self._photo_penalty_per_photo
         score = max(0.0, 1.0 - p_sum)
-
         return RuleResult(
             rule_name=self.name,
             score=score,
