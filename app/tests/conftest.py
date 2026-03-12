@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 import pytest
+from httpx import ASGITransport, AsyncClient
 
 from app.bootstrap import bootstrap
 from app.schemas.envelope import UserContext
@@ -36,6 +37,20 @@ from app.scoring.common.trust_advisor import UserSubmissionStats
 def _populate_registry() -> None:
     """Populate the project registry before any test runs."""
     bootstrap()
+
+
+# ── Async HTTP client fixture ─────────────────────────────────────────────────
+
+@pytest.fixture
+async def async_client() -> AsyncClient:
+    """Return an httpx AsyncClient wired directly to the Winnow FastAPI app."""
+    from app.main import app
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        yield client
 
 
 # ── Shared timestamp ──────────────────────────────────────────────────────────
