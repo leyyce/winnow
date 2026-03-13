@@ -112,19 +112,40 @@ class RequiredValidations(BaseModel):
     its review queue and access controls without a second round-trip. Winnow is the
     Governance Authority; the client acts as a Task Client rendering whatever Winnow
     permits.
+
+    Role-weights pattern (Task 2 — Dynamic Governance):
+    Instead of a single ``min_validators`` counter and a hard ``required_role``
+    string, governance thresholds are expressed as a ``threshold_score`` (the
+    minimum accumulated weight needed to finalise) and a ``role_weights`` dict
+    (mapping role name → integer weight contribution per vote).  The voting
+    service sums the weights of all eligible approve/reject votes; when the sum
+    reaches ``threshold_score`` the submission is auto-finalised.
+
+    Example — "2 citizens OR 1 expert":
+        threshold_score=2, role_weights={"citizen": 1, "expert": 2}
+        → two citizen approvals (1+1=2) OR one expert approval (2) both meet
+          the threshold without any hardcoded role-check in the service layer.
     """
 
-    min_validators: int = Field(
+    threshold_score: int = Field(
         ge=1,
-        description="Minimum number of distinct reviewers that must validate this submission.",
+        description=(
+            "Minimum accumulated role-weight needed to finalise a submission. "
+            "The voting service sums role_weights[voter_role] for each eligible "
+            "vote; when approve_sum or reject_sum >= threshold_score the submission "
+            "transitions to 'approved' or 'rejected' respectively."
+        ),
+    )
+    role_weights: dict[str, int] = Field(
+        description=(
+            "Mapping of reviewer role → integer weight contributed per vote. "
+            "Roles absent from this dict (or with weight 0) are ineligible to "
+            "vote on this submission, replacing the old hard required_role check."
+        ),
     )
     required_min_trust: int = Field(
         ge=0,
         description="Minimum trust level a reviewer must hold to be eligible. Scale is project-specific.",
-    )
-    required_role: str | None = Field(
-        default=None,
-        description="Role constraint for eligible reviewers (e.g. 'expert'). None = any role.",
     )
     review_tier: str = Field(
         min_length=1,
@@ -151,8 +172,16 @@ class ScoringResultResponse(BaseModel):
         min_length=1,
         description="Project this submission belongs to.",
     )
-    status: Literal["pending_finalization", "approved", "rejected"] = Field(
-        description="Current lifecycle state of the submission.",
+    status: Literal[
+        "pending_review", "pending_finalization", "approved", "rejected", "superseded",
+    ] = Field(
+        description=(
+            "Current lifecycle state of the submission. "
+            "'pending_review' = awaiting votes (Governance Engine flow). "
+            "'pending_finalization' = legacy status (pre-voting flow). "
+            "'approved'/'rejected' = terminal states set by vote threshold. "
+            "'superseded' = replaced by a corrected submission."
+        ),
     )
     confidence_score: float = Field(
         ge=0.0,

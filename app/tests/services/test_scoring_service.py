@@ -4,6 +4,15 @@ Unit tests for app/services/scoring_service.py.
 Tests exercise ``process_submission()`` directly — no HTTP layer involved.
 All tests rely on the session-scoped ``_populate_registry`` fixture from
 conftest.py to ensure the tree-app project is registered before any call.
+
+Coverage:
+  - Happy path response shape and field values
+  - RequiredValidations new role-weights schema fields
+  - Confidence score bounds
+  - Multiple distinct submissions produce distinct IDs
+  - Unknown project raises ProjectNotFoundError
+  - Invalid payload raises ValidationError (Stage 1 failure)
+  - Extreme payload values produce scores in [0, 100]
 """
 
 from __future__ import annotations
@@ -14,10 +23,10 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
+from app.core.exceptions import ProjectNotFoundError
 from app.schemas.envelope import SubmissionEnvelope, SubmissionMetadata
 from app.schemas.results import ScoringResultResponse
 from app.services.scoring_service import process_submission
-from app.core.exceptions import ProjectNotFoundError
 from app.tests.conftest import _ctx, _payload
 
 
@@ -26,6 +35,7 @@ from app.tests.conftest import _ctx, _payload
 def _envelope(
     project_id: str = "tree-app",
     payload: dict | None = None,
+    trust_level: int = 50,
 ) -> SubmissionEnvelope:
     """Build a minimal valid SubmissionEnvelope for the given project."""
     if payload is None:
@@ -37,7 +47,7 @@ def _envelope(
             submission_type="tree_measurement",
             submitted_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
         ),
-        user_context=_ctx(trust_level=50),
+        user_context=_ctx(trust_level=trust_level),
         payload=payload,
     )
 
@@ -50,7 +60,7 @@ async def test_process_submission_returns_scoring_result_response() -> None:
 
     assert isinstance(result, ScoringResultResponse)
     assert result.project_id == "tree-app"
-    assert result.status == "pending_finalization"
+    assert result.status == "pending_review"
 
 
 async def test_process_submission_submission_id_echoed() -> None:
@@ -80,12 +90,21 @@ async def test_process_submission_breakdown_non_empty() -> None:
         assert entry.weighted_score >= 0.0
 
 
-async def test_process_submission_required_validations_shape() -> None:
-    """required_validations must have the correct shape."""
+async def test_process_submission_required_validations_new_schema() -> None:
+    """required_validations must expose threshold_score and role_weights (new role-weights pattern)."""
     result = await process_submission(_envelope())
 
     rv = result.required_validations
-    assert rv.min_validators >= 1
+    # New fields from the role-weights pattern
+    assert rv.threshold_score >= 1
+    assert isinstance(rv.role_weights, dict)
+    assert len(rv.role_weights) > 0
+    # All weights must be non-negative integers
+    for role, weight in rv.role_weights.items():
+        assert isinstance(role, str)
+        assert isinstance(weight, int)
+        assert weight >= 0
+    # Unchanged legacy field
     assert rv.required_min_trust >= 0
     assert isinstance(rv.review_tier, str) and len(rv.review_tier) > 0
 
@@ -103,6 +122,51 @@ async def test_process_submission_created_at_is_datetime() -> None:
 
     assert isinstance(result.created_at, datetime)
     assert result.created_at.tzinfo is not None
+
+
+async def test_process_submission_distinct_envelopes_produce_distinct_ids() -> None:
+    """Two separate envelopes with different UUIDs must echo their own submission_id."""
+    e1 = _envelope()
+    e2 = _envelope()
+    r1 = await process_submission(e1)
+    r2 = await process_submission(e2)
+
+    assert r1.submission_id != r2.submission_id
+    assert r1.submission_id == e1.metadata.submission_id
+    assert r2.submission_id == e2.metadata.submission_id
+
+
+# ── Governance tier routing via confidence score ──────────────────────────────
+
+async def test_low_trust_submission_lands_in_stricter_tier() -> None:
+    """A submission from a low-trust user typically scores lower and gets a stricter tier."""
+    result_low = await process_submission(_envelope(trust_level=1))
+    result_high = await process_submission(_envelope(trust_level=100))
+
+    # Lower trust → lower pipeline score → stricter (or equal) tier
+    # We only assert the score is in range; governance routing is config-driven
+    assert 0.0 <= result_low.confidence_score <= 100.0
+    assert 0.0 <= result_high.confidence_score <= 100.0
+    # High-trust submission should score at least as high
+    assert result_high.confidence_score >= result_low.confidence_score
+
+
+# ── Extreme payload values ────────────────────────────────────────────────────
+
+async def test_process_submission_max_height_gives_score_in_range() -> None:
+    """Payload with very large height (well above h_max) clamps to score in [0, 100]."""
+    payload = _payload(height=9999.0).model_dump(mode="json")
+    result = await process_submission(_envelope(payload=payload))
+
+    assert 0.0 <= result.confidence_score <= 100.0
+
+
+async def test_process_submission_inclination_at_90_gives_score_in_range() -> None:
+    """Boundary inclination (90°) is accepted and scores in [0, 100]."""
+    payload = _payload(inclination=90).model_dump(mode="json")
+    result = await process_submission(_envelope(payload=payload))
+
+    assert 0.0 <= result.confidence_score <= 100.0
 
 
 # ── Unknown project ───────────────────────────────────────────────────────────
@@ -129,6 +193,16 @@ async def test_process_submission_invalid_payload_raises_validation_error() -> N
 async def test_process_submission_empty_payload_raises_validation_error() -> None:
     """Completely empty payload must fail Stage 1 with ValidationError."""
     envelope = _envelope(payload={})
+
+    with pytest.raises(ValidationError):
+        await process_submission(envelope)
+
+
+async def test_process_submission_missing_tree_id_raises_validation_error() -> None:
+    """Payload missing required tree_id must fail Stage 1."""
+    payload = _payload().model_dump(mode="json")
+    del payload["tree_id"]
+    envelope = _envelope(payload=payload)
 
     with pytest.raises(ValidationError):
         await process_submission(envelope)

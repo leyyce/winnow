@@ -18,7 +18,14 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from app.core.config import settings
-from app.core.exceptions import NotImplementedYetError, ProjectNotFoundError
+from app.core.exceptions import (
+    AlreadyFinalizedError,
+    DuplicateVoteError,
+    NotEligibleError,
+    NotImplementedYetError,
+    ProjectNotFoundError,
+    SubmissionNotFoundError,
+)
 from app.schemas.errors import FieldError, ProblemDetail
 
 logger = logging.getLogger(__name__)
@@ -118,6 +125,66 @@ def register_exception_handlers(app: FastAPI) -> None:
             type=_type_uri("not-implemented"),
             title="Not Implemented",
             status=501,
+            detail=str(exc),
+            instance=str(request.url.path),
+        )
+        return _problem_response(problem)
+
+    @app.exception_handler(SubmissionNotFoundError)
+    async def _handle_submission_not_found(
+        request: Request,
+        exc: SubmissionNotFoundError,
+    ) -> JSONResponse:
+        """404 — submission_id not found in the store."""
+        problem = ProblemDetail(
+            type=_type_uri("submission-not-found"),
+            title="Submission Not Found",
+            status=404,
+            detail=str(exc),
+            instance=str(request.url.path),
+        )
+        return _problem_response(problem)
+
+    @app.exception_handler(DuplicateVoteError)
+    async def _handle_duplicate_vote(
+        request: Request,
+        exc: DuplicateVoteError,
+    ) -> JSONResponse:
+        """409 — user has already voted on this submission."""
+        problem = ProblemDetail(
+            type=_type_uri("duplicate-vote"),
+            title="Duplicate Vote",
+            status=409,
+            detail=str(exc),
+            instance=str(request.url.path),
+        )
+        return _problem_response(problem)
+
+    @app.exception_handler(AlreadyFinalizedError)
+    async def _handle_already_finalized(
+        request: Request,
+        exc: AlreadyFinalizedError,
+    ) -> JSONResponse:
+        """409 — submission already finalized."""
+        problem = ProblemDetail(
+            type=_type_uri("already-finalized"),
+            title="Already Finalized",
+            status=409,
+            detail=str(exc),
+            instance=str(request.url.path),
+        )
+        return _problem_response(problem)
+
+    @app.exception_handler(NotEligibleError)
+    async def _handle_not_eligible(
+        request: Request,
+        exc: NotEligibleError,
+    ) -> JSONResponse:
+        """403 — reviewer does not meet eligibility requirements."""
+        problem = ProblemDetail(
+            type=_type_uri("not-eligible"),
+            title="Not Eligible",
+            status=403,
             detail=str(exc),
             instance=str(request.url.path),
         )

@@ -97,28 +97,35 @@ class TreeProjectBuilder(ProjectBuilder):
         )
 
         # ── Governance tiers (sorted automatically, highest threshold first) ─
+        # Role-weights pattern: threshold_score is the minimum accumulated weight
+        # to finalise; role_weights maps role → per-vote weight contribution.
+        # Roles absent from role_weights (or with weight 0) are ineligible.
+        #
+        # peer_review    : 1 citizen  OR  1 expert   (threshold_score=1)
+        # community_review: 2 citizens OR  1 expert  (threshold_score=2)
+        # expert_review  : 1 expert only             (citizen weight=0 → ineligible)
         governance_policy = TreeGovernancePolicy(
             tiers=[
                 GovernanceTier(
                     score_threshold=80.0,
                     review_tier="peer_review",
-                    min_validators=1,
+                    threshold_score=1,
+                    role_weights={"citizen": 1, "expert": 1},
                     required_min_trust=30,
-                    required_role=None,
                 ),
                 GovernanceTier(
                     score_threshold=50.0,
                     review_tier="community_review",
-                    min_validators=2,
+                    threshold_score=2,
+                    role_weights={"citizen": 1, "expert": 2},
                     required_min_trust=50,
-                    required_role=None,
                 ),
                 GovernanceTier(
                     score_threshold=0.0,
                     review_tier="expert_review",
-                    min_validators=1,
+                    threshold_score=3,
+                    role_weights={"expert": 3},
                     required_min_trust=75,
-                    required_role="expert",
                 ),
             ]
         )

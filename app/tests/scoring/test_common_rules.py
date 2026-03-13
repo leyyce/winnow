@@ -79,6 +79,34 @@ class TestTrustLevelRule:
         with pytest.raises(ValueError, match="trust_level_max"):
             TrustLevelRule(weight=0.25, trust_level_mid=50, trust_level_max=50)
 
+    def test_trust_one_below_mid_gives_less_than_half(self):
+        # Trust 49 < mid 50 → score < 0.5
+        result = self.rule.evaluate(_payload(), _ctx(49))
+        assert result.score < 0.5
+
+    def test_trust_one_above_mid_gives_more_than_half(self):
+        # Trust 51 > mid 50 → score > 0.5
+        result = self.rule.evaluate(_payload(), _ctx(51))
+        assert result.score > 0.5
+
+    def test_trust_one_below_max_gives_less_than_one(self):
+        # Trust 99 < max 100 → score < 1.0
+        result = self.rule.evaluate(_payload(), _ctx(99))
+        assert result.score < 1.0
+
+    def test_trust_level_1_gives_very_small_positive_score(self):
+        # Trust 1 (barely above zero) → very small but positive score
+        result = self.rule.evaluate(_payload(), _ctx(1))
+        assert 0.0 < result.score < 0.1
+
+    def test_score_is_monotonically_increasing_with_trust(self):
+        # Scores at trust 0, 25, 50, 75, 100 must be strictly increasing
+        scores = [
+            self.rule.evaluate(_payload(), _ctx(tl)).score
+            for tl in [0, 25, 50, 75, 100]
+        ]
+        assert all(scores[i] < scores[i + 1] for i in range(len(scores) - 1))
+
 
 # ── TrustAdvisor ─────────────────────────────────────────────────────────────
 
@@ -135,6 +163,62 @@ class TestTrustAdvisor:
     def test_reason_contains_streak_info(self):
         result = self.advisor.compute_adjustment(self.user_id, 20, "approved", _user_stats(consecutive=5))
         assert "streak" in result.reason.lower() or "consecutive" in result.reason.lower()
+
+    def test_streak_bonus_not_applied_for_rejection(self):
+        # Streak only rewards consistent approval — rejection never triggers the bonus
+        result = self.advisor.compute_adjustment(
+            self.user_id, 20, "rejected", _user_stats(consecutive=10)
+        )
+        assert result.recommended_delta == -3  # penalty only, no streak bonus
+
+    def test_streak_boundary_one_below_threshold_no_bonus(self):
+        # consecutive = streak_threshold - 1 → no bonus
+        result = self.advisor.compute_adjustment(
+            self.user_id, 20, "approved", _user_stats(consecutive=4)
+        )
+        assert result.recommended_delta == 1  # reward only
+
+    def test_streak_boundary_exactly_at_threshold_gives_bonus(self):
+        # consecutive = streak_threshold exactly → bonus applied
+        result = self.advisor.compute_adjustment(
+            self.user_id, 20, "approved", _user_stats(consecutive=5)
+        )
+        assert result.recommended_delta == 1 + 2
+
+    def test_trust_advisor_zero_consecutive_no_bonus(self):
+        result = self.advisor.compute_adjustment(
+            self.user_id, 50, "approved", _user_stats(consecutive=0)
+        )
+        assert result.recommended_delta == 1
+
+    def test_bounds_echoed_correctly_from_config(self):
+        config = TrustAdvisorConfig(
+            reward_per_approval=2,
+            penalty_per_rejection=5,
+            streak_bonus=3,
+            streak_threshold=3,
+            min_trust=10,
+            max_trust=200,
+        )
+        advisor = TrustAdvisor(config)
+        result = advisor.compute_adjustment(self.user_id, 50, "approved", _user_stats())
+        assert result.project_min_trust == 10
+        assert result.project_max_trust == 200
+
+    def test_reward_and_penalty_from_config_are_applied(self):
+        config = TrustAdvisorConfig(
+            reward_per_approval=5,
+            penalty_per_rejection=10,
+            streak_bonus=0,
+            streak_threshold=99,
+            min_trust=0,
+            max_trust=100,
+        )
+        advisor = TrustAdvisor(config)
+        r_approve = advisor.compute_adjustment(self.user_id, 50, "approved", _user_stats())
+        r_reject = advisor.compute_adjustment(self.user_id, 50, "rejected", _user_stats())
+        assert r_approve.recommended_delta == 5
+        assert r_reject.recommended_delta == -10
 
 
 # ── ScoringRegistry ───────────────────────────────────────────────────────────

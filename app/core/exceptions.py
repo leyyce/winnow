@@ -44,3 +44,42 @@ class NotImplementedYetError(WinnowError):
     def __init__(self, feature: str) -> None:
         self.feature = feature
         super().__init__(f"{feature} is not yet implemented (requires DB persistence layer).")
+
+
+class SubmissionNotFoundError(WinnowError):
+    """Raised when a submission_id does not exist in the store."""
+
+    def __init__(self, submission_id: object) -> None:
+        self.submission_id = submission_id
+        super().__init__(f"Submission '{submission_id}' not found.")
+
+
+class DuplicateVoteError(WinnowError):
+    """Raised when the same user_id attempts to vote twice on the same submission."""
+
+    def __init__(self, submission_id: object, user_id: object) -> None:
+        self.submission_id = submission_id
+        self.user_id = user_id
+        super().__init__(
+            f"User '{user_id}' has already voted on submission '{submission_id}'."
+        )
+
+
+class AlreadyFinalizedError(WinnowError):
+    """Raised when a vote or status change is attempted on an already-finalized submission."""
+
+    def __init__(self, submission_id: object, current_status: str) -> None:
+        self.submission_id = submission_id
+        self.current_status = current_status
+        super().__init__(
+            f"Submission '{submission_id}' is already finalized "
+            f"with status '{current_status}'."
+        )
+
+
+class NotEligibleError(WinnowError):
+    """Raised when a reviewer does not meet the trust/role requirements for a submission."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(f"Reviewer is not eligible: {reason}")

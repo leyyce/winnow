@@ -7,7 +7,9 @@ HTTP server). The ``async_client`` fixture is defined in conftest.py.
 Covered endpoints
 -----------------
 * GET  /health
-* POST /api/v1/submissions  (happy path, bad envelope, unknown project)
+* POST /api/v1/submissions  (happy path, bad envelope, unknown project,
+                             RFC 7807 field assertions, idempotency,
+                             required_validations shape, boundary payloads)
 """
 
 from __future__ import annotations
@@ -82,7 +84,7 @@ async def test_post_submission_response_shape(async_client: AsyncClient) -> None
     assert "submission_id" in body
     assert "project_id" in body
     assert body["project_id"] == "tree-app"
-    assert body["status"] == "pending_finalization"
+    assert body["status"] == "pending_review"
     assert "confidence_score" in body
     assert "breakdown" in body
     assert "required_validations" in body
@@ -144,3 +146,182 @@ async def test_post_submission_unknown_project_rfc7807_type(async_client: AsyncC
 
     body = response.json()
     assert body["type"].endswith("/errors/unknown-project")
+
+
+# ── RFC 7807 field-level assertions ───────────────────────────────────────────
+
+async def test_post_submission_missing_metadata_422_mentions_field(
+    async_client: AsyncClient,
+) -> None:
+    """422 detail for missing metadata fields must name the offending field."""
+    response = await async_client.post("/api/v1/submissions", json={})
+    body = response.json()
+
+    assert response.status_code == 422
+    # RFC 7807 ProblemDetail must carry type/title/status
+    assert body["type"].endswith("/errors/validation-error")
+    assert body["status"] == 422
+    # The 'errors' list must name at least one concrete field path
+    fields = [e["field"] for e in body.get("errors", [])]
+    assert any("metadata" in f or "user_context" in f for f in fields)
+
+
+async def test_post_submission_missing_user_context_422_mentions_field(
+    async_client: AsyncClient,
+) -> None:
+    """422 when user_context is absent must name that field in the detail."""
+    envelope = _valid_envelope()
+    del envelope["user_context"]
+    response = await async_client.post("/api/v1/submissions", json=envelope)
+    body = response.json()
+
+    assert response.status_code == 422
+    fields = [e["field"] for e in body.get("errors", [])]
+    assert any("user_context" in f for f in fields)
+
+
+async def test_post_submission_negative_trust_level_422_mentions_field(
+    async_client: AsyncClient,
+) -> None:
+    """Negative trust_level in user_context → 422 mentioning 'trust_level'."""
+    envelope = _valid_envelope()
+    envelope["user_context"]["trust_level"] = -1
+    response = await async_client.post("/api/v1/submissions", json=envelope)
+    body = response.json()
+
+    assert response.status_code == 422
+    fields = [e["field"] for e in body.get("errors", [])]
+    assert any("trust_level" in f for f in fields)
+
+
+async def test_post_submission_empty_project_id_422_mentions_field(
+    async_client: AsyncClient,
+) -> None:
+    """Empty project_id → 422 mentioning 'project_id'."""
+    envelope = _valid_envelope()
+    envelope["metadata"]["project_id"] = ""
+    response = await async_client.post("/api/v1/submissions", json=envelope)
+    body = response.json()
+
+    assert response.status_code == 422
+    fields = [e["field"] for e in body.get("errors", [])]
+    assert any("project_id" in f for f in fields)
+
+
+# ── Idempotency — same UUID submitted twice ───────────────────────────────────
+
+async def test_post_submission_same_uuid_twice_both_succeed(
+    async_client: AsyncClient,
+) -> None:
+    """
+    Submitting the same submission_id twice must not crash.
+
+    In the stub (no-DB) phase both calls process independently and return 201.
+    This test documents and guards the idempotency contract: once the DB layer
+    arrives, the second call must return the cached result, not a 500.
+    """
+    envelope = _valid_envelope()
+    r1 = await async_client.post("/api/v1/submissions", json=envelope)
+    r2 = await async_client.post("/api/v1/submissions", json=envelope)
+
+    # Both must succeed — no 5xx
+    assert r1.status_code == 201
+    assert r2.status_code in (200, 201)
+    # Both must echo the same submission_id
+    assert r1.json()["submission_id"] == r2.json()["submission_id"]
+
+
+# ── required_validations shape (role-weights pattern) ─────────────────────────
+
+async def test_post_submission_required_validations_has_threshold_score(
+    async_client: AsyncClient,
+) -> None:
+    """required_validations in 201 body must contain threshold_score >= 1."""
+    response = await async_client.post("/api/v1/submissions", json=_valid_envelope())
+    rv = response.json()["required_validations"]
+
+    assert "threshold_score" in rv
+    assert rv["threshold_score"] >= 1
+
+
+async def test_post_submission_required_validations_has_role_weights(
+    async_client: AsyncClient,
+) -> None:
+    """required_validations must contain role_weights dict with str keys."""
+    response = await async_client.post("/api/v1/submissions", json=_valid_envelope())
+    rv = response.json()["required_validations"]
+
+    assert "role_weights" in rv
+    assert isinstance(rv["role_weights"], dict)
+    for role, weight in rv["role_weights"].items():
+        assert isinstance(role, str)
+        assert isinstance(weight, int)
+
+
+async def test_post_submission_required_validations_no_old_fields(
+    async_client: AsyncClient,
+) -> None:
+    """required_validations must NOT contain the old min_validators or required_role fields."""
+    response = await async_client.post("/api/v1/submissions", json=_valid_envelope())
+    rv = response.json()["required_validations"]
+
+    assert "min_validators" not in rv
+    assert "required_role" not in rv
+
+
+# ── Boundary payload values ───────────────────────────────────────────────────
+
+async def test_post_submission_very_large_height_returns_201(
+    async_client: AsyncClient,
+) -> None:
+    """Height well above h_max is schema-valid; pipeline clamps score to [0, 100]."""
+    envelope = _valid_envelope()
+    envelope["payload"]["measurement"]["height"] = 9999.0
+    response = await async_client.post("/api/v1/submissions", json=envelope)
+
+    assert response.status_code == 201
+    assert 0.0 <= response.json()["confidence_score"] <= 100.0
+
+
+async def test_post_submission_inclination_at_90_returns_201(
+    async_client: AsyncClient,
+) -> None:
+    """Inclination exactly at the schema boundary (90°) must succeed."""
+    envelope = _valid_envelope()
+    envelope["payload"]["measurement"]["inclination"] = 90
+    response = await async_client.post("/api/v1/submissions", json=envelope)
+
+    assert response.status_code == 201
+
+
+async def test_post_submission_inclination_above_90_returns_422(
+    async_client: AsyncClient,
+) -> None:
+    """Inclination 91° violates the schema constraint → 422."""
+    envelope = _valid_envelope()
+    envelope["payload"]["measurement"]["inclination"] = 91
+    response = await async_client.post("/api/v1/submissions", json=envelope)
+
+    assert response.status_code == 422
+
+
+async def test_post_submission_negative_height_returns_422(
+    async_client: AsyncClient,
+) -> None:
+    """Negative height is physically impossible → 422."""
+    envelope = _valid_envelope()
+    envelope["payload"]["measurement"]["height"] = -1.0
+    response = await async_client.post("/api/v1/submissions", json=envelope)
+
+    assert response.status_code == 422
+
+
+async def test_post_submission_zero_trunk_diameter_returns_422(
+    async_client: AsyncClient,
+) -> None:
+    """Zero trunk diameter violates the ge=1 constraint → 422."""
+    envelope = _valid_envelope()
+    envelope["payload"]["measurement"]["trunk_diameter"] = 0
+    response = await async_client.post("/api/v1/submissions", json=envelope)
+
+    assert response.status_code == 422

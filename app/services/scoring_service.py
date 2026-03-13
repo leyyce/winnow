@@ -17,7 +17,8 @@ from uuid import UUID
 from app.core.exceptions import NotImplementedYetError
 from app.registry.manager import registry
 from app.schemas.envelope import SubmissionEnvelope
-from app.schemas.finalization import FinalizationRequest, FinalizationResponse
+# from app.schemas.finalization import FinalizationRequest, FinalizationResponse
+from app.schemas.supersede import SupersedeRequest, SupersedeResponse
 from app.schemas.results import RuleBreakdown, ScoringResultResponse
 
 logger = logging.getLogger(__name__)
@@ -93,7 +94,7 @@ async def process_submission(envelope: SubmissionEnvelope) -> ScoringResultRespo
     return ScoringResultResponse(
         submission_id=submission_id,
         project_id=project_id,
-        status="pending_finalization",
+        status="pending_review",
         confidence_score=pipeline_result.total_score,
         breakdown=breakdown,
         required_validations=required,
@@ -101,20 +102,18 @@ async def process_submission(envelope: SubmissionEnvelope) -> ScoringResultRespo
         created_at=datetime.now(timezone.utc),
     )
 
-
-async def finalize_submission(
+async def supersede_submission(
     submission_id: UUID,
-    request: FinalizationRequest,
-) -> FinalizationResponse:
+    request: SupersedeRequest,
+) -> SupersedeResponse:
     """
-    Close the feedback loop: record ground-truth outcome and compute trust delta.
+    Mark a submission as superseded by a newer corrected one.
 
     Steps
     -----
-    1. [STUB] Load submission — raises NotImplementedYetError until DB layer is added.
-    2. [STUB] Update submission status.
-    3. Compute trust adjustment recommendation via TrustAdvisor.
-    4. Return FinalizationResponse.
+    1. [STUB] Load submission from DB — not implemented until Sprint 3.
+    2. [STUB] Transition status to 'superseded'.
+    3. Return SupersedeResponse.
 
     Raises
     ------
@@ -122,7 +121,7 @@ async def finalize_submission(
         Always, until the DB persistence layer is implemented.
     """
     # Step 1 — [STUB] load submission from DB
-    # TODO: load submission from DB and resolve config
+    # TODO: load submission from DB, validate it exists and is not already finalized
     raise NotImplementedYetError(
-        f"finalize_submission({submission_id!s})"
+        f"supersede_submission({submission_id!s})"
     )

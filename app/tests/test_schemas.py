@@ -56,9 +56,9 @@ def _thresholds(**overrides) -> dict:
 
 def _required_validations(**overrides) -> dict:
     base = dict(
-        min_validators=2,
+        threshold_score=2,
+        role_weights={"citizen": 1, "expert": 2},
         required_min_trust=10,
-        required_role=None,
         review_tier="peer_review",
     )
     base.update(overrides)
@@ -286,16 +286,38 @@ class TestThresholdConfig:
 class TestRequiredValidations:
     def test_valid_construction(self):
         rv = RequiredValidations.model_validate(_required_validations())
-        assert rv.min_validators == 2
-        assert rv.required_role is None
+        assert rv.threshold_score == 2
+        assert rv.role_weights == {"citizen": 1, "expert": 2}
+        assert rv.required_min_trust == 10
+        assert rv.review_tier == "peer_review"
 
-    def test_required_role_present(self):
-        rv = RequiredValidations.model_validate(_required_validations(required_role="expert"))
-        assert rv.required_role == "expert"
+    def test_role_weights_expert_only(self):
+        # Expert-only tier: citizen absent → weight 0 → ineligible by convention
+        rv = RequiredValidations.model_validate(
+            _required_validations(role_weights={"expert": 3})
+        )
+        assert rv.role_weights == {"expert": 3}
+        assert rv.role_weights.get("citizen", 0) == 0
 
-    def test_min_validators_zero_rejected(self):
-        with pytest.raises(ValidationError, match="min_validators"):
-            RequiredValidations.model_validate(_required_validations(min_validators=0))
+    def test_role_weights_empty_dict_accepted(self):
+        # An empty role_weights means no role is eligible — unusual but schema-valid
+        rv = RequiredValidations.model_validate(
+            _required_validations(role_weights={})
+        )
+        assert rv.role_weights == {}
+
+    def test_threshold_score_zero_rejected(self):
+        with pytest.raises(ValidationError, match="threshold_score"):
+            RequiredValidations.model_validate(_required_validations(threshold_score=0))
+
+    def test_threshold_score_negative_rejected(self):
+        with pytest.raises(ValidationError, match="threshold_score"):
+            RequiredValidations.model_validate(_required_validations(threshold_score=-1))
+
+    def test_threshold_score_one_accepted(self):
+        # Boundary: threshold_score=1 is the minimum valid value
+        rv = RequiredValidations.model_validate(_required_validations(threshold_score=1))
+        assert rv.threshold_score == 1
 
     def test_required_min_trust_zero_allowed(self):
         rv = RequiredValidations.model_validate(_required_validations(required_min_trust=0))
@@ -313,6 +335,16 @@ class TestRequiredValidations:
         # Trust scale is project-specific — no le= upper bound
         rv = RequiredValidations.model_validate(_required_validations(required_min_trust=500))
         assert rv.required_min_trust == 500
+
+    def test_old_min_validators_field_does_not_exist(self):
+        # Ensure the old field name is gone — callers must use threshold_score
+        rv = RequiredValidations.model_validate(_required_validations())
+        assert not hasattr(rv, "min_validators")
+
+    def test_old_required_role_field_does_not_exist(self):
+        # Ensure the old field name is gone — role constraints live in role_weights
+        rv = RequiredValidations.model_validate(_required_validations())
+        assert not hasattr(rv, "required_role")
 
 
 # ── ScoringResultResponse ──────────────────────────────────────────────────────

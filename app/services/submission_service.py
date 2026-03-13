@@ -14,15 +14,23 @@ from __future__ import annotations
 
 from app.schemas.envelope import SubmissionEnvelope
 from app.schemas.results import ScoringResultResponse
-from app.services import scoring_service
+from app.services import scoring_service, voting_service
 
 
 async def submit(envelope: SubmissionEnvelope) -> ScoringResultResponse:
     """
-    Accept a submission envelope and delegate orchestration to the scoring service.
+    Accept a submission envelope, delegate to scoring, and register for voting.
+
+    After scoring completes, the submission is registered in the voting
+    service's in-memory store so reviewers can cast votes on it.
 
     Future work: idempotency check (return existing result if submission_id
     already exists in DB) would be inserted here before delegating.
     """
     # TODO: idempotency check — if submission_id already exists, return cached result
-    return await scoring_service.process_submission(envelope)
+    result = await scoring_service.process_submission(envelope)
+
+    # Register the scored submission for vote tracking
+    voting_service.register_submission(result)
+
+    return result

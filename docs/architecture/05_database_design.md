@@ -64,7 +64,7 @@ One-to-one relationship with `submissions`. Stores the output of the scoring pip
 | `submission_id` | `UUID` | `FK → submissions.id, UNIQUE, NOT NULL` | One scoring result per submission. |
 | `confidence_score` | `FLOAT` | `NOT NULL, CHECK (0 <= val <= 100)` | Final weighted Confidence Score (0–100 scale). |
 | `breakdown` | `JSONB` | `NOT NULL` | Array of `RuleBreakdown` objects: `[{rule, weight, score, weighted_score, details}]`. |
-| `required_validations` | `JSONB` | `NOT NULL` | Governance Target State: `{min_validators, required_min_trust, required_role, review_tier}`. |
+| `required_validations` | `JSONB` | `NOT NULL` | Governance Target State: `{threshold_score, role_weights, required_min_trust, review_tier}`. Role-weights pattern (Sprint 2.5): `threshold_score` replaces `min_validators`; `role_weights` dict replaces `required_role`. |
 | `thresholds` | `JSONB` | `NOT NULL` | Snapshot of `ThresholdConfig` at scoring time: `{auto_approve_min, manual_review_min}`. |
 | `reviewed_by` | `VARCHAR` | `NULL` | Who made the finalization decision (set on `PATCH /final-status`). |
 | `review_note` | `VARCHAR` | `NULL` | Optional explanation from the reviewer. |
@@ -89,6 +89,53 @@ These fields are stored as JSONB rather than normalised into child tables becaus
 3. **Normalisation cost is high, benefit is low.** A `rule_scores` child table would add N rows per submission (one per rule) with no operational query benefit. JSONB keeps writes atomic and reads efficient (single row fetch).
 
 If future analytics require cross-submission rule-level queries, a materialised view or ETL pipeline over the JSONB data is the recommended approach — not schema normalisation.
+
+#### Table: `submission_votes`
+
+Stores individual reviewer votes. One row per (submission, voter) pair. Introduced in Sprint 2.5 (Governance Engine upgrade). See `03_api_contracts.md` §9 for the full voting flow.
+
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | `UUID` | `PK, DEFAULT gen_random_uuid()` | Server-generated surrogate key. |
+| `submission_id` | `UUID` | `FK → submissions.id, NOT NULL` | The submission being voted on. |
+| `user_id` | `UUID` | `NOT NULL` | Reviewer's stable user identifier from the client system. |
+| `vote` | `VARCHAR` | `NOT NULL, CHECK IN ('approve', 'reject')` | The reviewer's decision. |
+| `user_trust_level` | `INTEGER` | `NOT NULL` | Reviewer's trust level at vote time (from wire). |
+| `user_role` | `VARCHAR` | `NOT NULL` | Reviewer's role at vote time (from wire). |
+| `note` | `VARCHAR` | `NULL` | Optional reviewer comment. |
+| `created_at` | `TIMESTAMPTZ` | `NOT NULL, DEFAULT now()` | When the vote was recorded. |
+
+**Constraints:**
+- `UNIQUE(submission_id, user_id)` — prevents duplicate votes. A reviewer may vote only once per submission.
+- `FK(submission_id) → submissions(id)` — referential integrity.
+
+**Design notes:**
+- Votes are **immutable** — once cast, a vote cannot be changed or retracted. This preserves audit integrity.
+- The `user_trust_level` and `user_role` are snapshots at vote time, not live values. This ensures threshold evaluation uses the reviewer's state at the moment they voted.
+- Threshold evaluation uses the **role-weights pattern**: the voting service sums `role_weights[user_role]` for all eligible votes (trust gate + weight gate); finalisation triggers when the accumulated weight ≥ `threshold_score`. See `03_api_contracts.md` §9.2 for the full algorithm.
+
+#### Table: `webhook_outbox`
+
+Implements the Transactional Outbox pattern for guaranteed webhook delivery. See `03_api_contracts.md` §10.3 for the full pattern.
+
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | `UUID` | `PK, DEFAULT gen_random_uuid()` | Server-generated surrogate key. |
+| `submission_id` | `UUID` | `FK → submissions.id, NOT NULL` | The submission that triggered the webhook. |
+| `event_type` | `VARCHAR` | `NOT NULL` | Event identifier, e.g. `'submission.finalized'`. |
+| `payload` | `JSONB` | `NOT NULL` | Full webhook payload to deliver. |
+| `status` | `VARCHAR` | `NOT NULL, DEFAULT 'pending'` | Delivery state: `'pending'`, `'in_progress'`, `'delivered'`, `'failed'`, `'dead_letter'`. |
+| `attempts` | `INTEGER` | `NOT NULL, DEFAULT 0` | Number of delivery attempts made so far. |
+| `max_attempts` | `INTEGER` | `NOT NULL` | Maximum attempts before moving to `dead_letter`. From project config. |
+| `next_retry_at` | `TIMESTAMPTZ` | `NULL` | When the next retry should be attempted. NULL for `pending` and terminal states. |
+| `last_error` | `VARCHAR` | `NULL` | Error message from the most recent failed attempt. |
+| `created_at` | `TIMESTAMPTZ` | `NOT NULL, DEFAULT now()` | When the outbox entry was created. |
+| `updated_at` | `TIMESTAMPTZ` | `NOT NULL, DEFAULT now()` | Last modification timestamp. |
+
+**Design notes:**
+- The outbox entry is **inserted atomically** in the same DB transaction that finalizes the submission. This guarantees no finalization occurs without a corresponding webhook attempt.
+- The `in_progress` status prevents concurrent outbox workers from picking up the same entry.
+- The `dead_letter` status is a terminal state requiring manual intervention or automated alerting.
 
 #### Table: `project_configs` (Phase 2 — Future)
 
@@ -148,7 +195,34 @@ erDiagram
         TIMESTAMPTZ updated_at
     }
 
+    submission_votes {
+        UUID id PK "server-generated"
+        UUID submission_id FK
+        UUID user_id "reviewer"
+        VARCHAR vote "approve | reject"
+        INTEGER user_trust_level
+        VARCHAR user_role
+        VARCHAR note "nullable"
+        TIMESTAMPTZ created_at
+    }
+
+    webhook_outbox {
+        UUID id PK "server-generated"
+        UUID submission_id FK
+        VARCHAR event_type
+        JSONB payload "webhook body"
+        VARCHAR status "pending | in_progress | delivered | failed | dead_letter"
+        INTEGER attempts
+        INTEGER max_attempts
+        TIMESTAMPTZ next_retry_at "nullable"
+        VARCHAR last_error "nullable"
+        TIMESTAMPTZ created_at
+        TIMESTAMPTZ updated_at
+    }
+
     submissions ||--|| scoring_results : "has one"
+    submissions ||--o{ submission_votes : "has many"
+    submissions ||--o{ webhook_outbox : "has many"
 ```
 
 ### 1.4 Index Strategy
@@ -160,6 +234,8 @@ erDiagram
 | `submissions` | `ix_submissions_status_project` | B-Tree (composite) | `(project_id, status)` — the primary query path for `GET /tasks/available` (find `pending_finalization` submissions per project). |
 | `scoring_results` | `ix_scoring_results_submission_id` | B-Tree (unique) | FK lookup + enforce 1:1 relationship. Automatically created by the `UNIQUE` constraint. |
 | `scoring_results` | `ix_scoring_results_confidence_score` | B-Tree | Range queries for dashboards (`WHERE confidence_score >= X`). |
+| `submission_votes` | `uq_submission_votes_submission_user` | B-Tree (unique composite) | `(submission_id, user_id)` — enforces one vote per user per submission. Also serves as the primary lookup path. |
+| `webhook_outbox` | `ix_webhook_outbox_status_next_retry` | B-Tree (composite) | `(status, next_retry_at)` — the outbox worker's polling query: `WHERE status IN ('pending', 'failed') AND next_retry_at <= now()`. |
 
 **JSONB GIN indexes — deferred:**
 
@@ -284,23 +360,24 @@ sequenceDiagram
 **Proposed `superseded` mechanism:**
 
 1. **Extend the status enum** to include `superseded` as a terminal state alongside `approved` and `rejected`.
-2. **New optional field on finalization:** `superseded_by: UUID | None` — the `submission_id` of the replacement submission. Stored on the `submissions` row for audit traceability.
+2. **`superseded_by` field:** Stored on the `submissions` row — the `submission_id` of the replacement submission. Required in the `SupersedeRequest` body.
 3. **Trust Advisor behaviour:** Submissions with `status = 'superseded'` are excluded from approval-rate and streak calculations. They are neutral — neither reward nor penalty.
 4. **Task query behaviour:** `superseded` submissions are excluded from `GET /tasks/available` results.
-5. **Client responsibility:** Laravel is responsible for calling `PATCH /submissions/AAA/final-status {status: "superseded", superseded_by: "BBB"}` when a correction is made. Winnow does not auto-detect corrections (it has no knowledge of domain-level entity identity like `tree_id`).
+5. **Client responsibility:** Laravel is responsible for calling `PATCH /submissions/AAA/supersede {status: "superseded", superseded_by: "BBB"}` when a correction is made. Winnow does not auto-detect corrections (it has no knowledge of domain-level entity identity like `tree_id`).
 
 **Updated status lifecycle:**
 
 ```mermaid
 stateDiagram-v2
-    [*] --> pending_finalization: POST /submissions
-    pending_finalization --> approved: PATCH /final-status (expert/community)
-    pending_finalization --> rejected: PATCH /final-status (expert/community)
-    pending_finalization --> superseded: PATCH /final-status (client correction)
+    [*] --> pending_review: POST /submissions
+    pending_review --> approved: POST /votes (vote threshold met)
+    pending_review --> rejected: POST /votes (vote threshold met)
+    pending_review --> superseded: PATCH /supersede (client correction)
     approved --> [*]
     rejected --> [*]
     superseded --> [*]
 
+    note right of approved: Auto-finalised by Governance Engine\nwhen accumulated role-weight ≥ threshold_score.
     note right of superseded: Replaced by a newer submission.\nTrust Advisor ignores this record.
 ```
 
@@ -312,7 +389,7 @@ Covered by §2.2 (`SELECT ... FOR UPDATE` pattern). The row-level pessimistic lo
 
 #### 2.4.2 Concurrent Finalization Attempts
 
-**Scenario:** Two reviewers simultaneously send `PATCH /submissions/{id}/final-status` — one with `approved`, one with `rejected`.
+**Scenario:** Two reviewers simultaneously send `POST /submissions/{id}/votes` — both approvals that would each independently trigger the threshold.
 
 **Proposed solution — optimistic locking with status guard:**
 
@@ -343,7 +420,7 @@ The `FOR UPDATE` lock on the submission row serialises concurrent finalization a
 
 #### 2.4.3 Submission Received During Finalization
 
-**Scenario:** A new `POST /submissions` arrives while a `PATCH /final-status` is being processed for a different submission by the same user. The Trust Advisor's `user_history` query could see inconsistent data.
+**Scenario:** A new `POST /submissions` arrives while a vote-threshold auto-finalization is being processed for a different submission by the same user. The Trust Advisor's `user_history` query could see inconsistent data.
 
 **Risk assessment:** 🟢 Low. The Trust Advisor queries aggregate stats (approval count, streak length). A single in-flight finalization causing a slightly stale count is an acceptable trade-off — the delta will be ±1 at most, and the next finalization will correct it. No special locking is needed.
 

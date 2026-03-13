@@ -266,9 +266,9 @@ Content-Type: application/json
     }
   ],
   "required_validations": {
-    "min_validators": 2,
+    "threshold_score": 2,
+    "role_weights": {"citizen": 1, "expert": 2},
     "required_min_trust": 5,
-    "required_role": null,
     "review_tier": "community_review"
   },
   "thresholds": {
@@ -304,9 +304,14 @@ class ThresholdConfig(BaseModel):
     # auto_approve_min >= manual_review_min
 
 class RequiredValidations(BaseModel):
-    min_validators: int          # e.g., 1, 2, 3
+    # Role-weights pattern (Sprint 2.5 Task 2 — Dynamic Governance):
+    # threshold_score replaces min_validators; role_weights replaces required_role.
+    # The voting service sums role_weights[voter_role] for each eligible vote;
+    # finalisation triggers when approve_sum or reject_sum >= threshold_score.
+    # Example — "2 citizens OR 1 expert": threshold_score=2, role_weights={"citizen":1,"expert":2}
+    threshold_score: int         # minimum accumulated role-weight to finalise
+    role_weights: dict[str, int] # role → weight contribution per vote (absent/0 = ineligible)
     required_min_trust: int      # minimum trust level for eligible reviewers
-    required_role: str | None    # e.g., "expert", None = any role
     review_tier: str             # e.g., "peer_review", "community_review", "expert_review"
 
 class ScoringResultResponse(BaseModel):
@@ -322,14 +327,21 @@ class ScoringResultResponse(BaseModel):
 
 ---
 
-## 3b. Finalization Request & Response
+## 3b. Supersede Request & Response
 
-After the client’s expert or community makes a final decision, the client notifies Winnow. This closes the feedback loop and triggers the Trust Advisor (Stage 4 output).
+> **Sprint 2.5 pivot:** The old `PATCH /final-status` accepting `approved`/`rejected` has been
+> **replaced**. `approved`/`rejected` transitions now happen automatically when the Governance
+> Engine's vote-threshold is met (see §9). The only remaining client-initiated status transition
+> is marking a submission as `superseded` when the user corrects their data.
+
+When a user corrects domain data in the client, the client sends a brand-new submission (new UUID)
+and then calls this endpoint to retire the old one. This preserves a complete audit trail without
+mutating any existing record (Rule 10 — Immutable Submissions & Append-Only State).
 
 ### Endpoint
 
 ```
-PATCH /api/v1/submissions/{submission_id}/final-status
+PATCH /api/v1/submissions/{submission_id}/supersede
 Content-Type: application/json
 ```
 
@@ -337,22 +349,24 @@ Content-Type: application/json
 
 ```json
 {
-  "final_status": "approved",
-  "reviewed_by": "expert_user_42",
-  "review_note": "Measurement confirmed on-site."
+  "status": "superseded",
+  "superseded_by": "new-submission-uuid"
 }
 ```
 
 ### Request Schema (Conceptual)
 
 ```python
-# app/schemas/finalization.py  (conceptual)
+# app/schemas/supersede.py
 
-class FinalizationRequest(BaseModel):
-    final_status: Literal["approved", "rejected"]
-    reviewed_by: str | None = None       # who made the decision
-    review_note: str | None = None       # optional explanation
+class SupersedeRequest(BaseModel):
+    status: Literal["superseded"]   # ONLY "superseded" accepted — schema rejects any other value
+    superseded_by: UUID              # UUID of the replacement submission
 ```
+
+> **Enforcement:** `status` is a `Literal["superseded"]` — Pydantic rejects `"approved"` or
+> `"rejected"` with a 422, preventing accidental misuse of this endpoint to bypass the
+> Governance Engine's automated finalization logic.
 
 ### Response (200 OK)
 
@@ -478,7 +492,7 @@ sequenceDiagram
     rect rgb(230, 255, 230)
     Note over User,WinnowDB: Phase 2 — Finalization & Trust Advisory
     User->>Laravel: Expert/community reviews & makes final decision
-    Laravel->>Winnow: PATCH /api/v1/submissions/{id}/final-status {approved}
+    Laravel->>Winnow: POST /api/v1/submissions/{id}/votes {approve, trust, role}
 
     Note over Winnow: Stage 4 output — Trust Evaluation & Advisory
     Winnow->>WinnowDB: Update status → approved (ground truth)
@@ -537,9 +551,9 @@ GET /api/v1/tasks/available?project_id=tree-app&user_trust=5&user_role=trusted
       "confidence_score": 67.5,
       "review_tier": "community_review",
       "required_validations": {
-        "min_validators": 2,
+        "threshold_score": 2,
+        "role_weights": {"citizen": 1, "expert": 2},
         "required_min_trust": 5,
-        "required_role": null,
         "review_tier": "community_review"
       },
       "submitted_at": "2026-03-10T17:30:01Z"
@@ -551,9 +565,9 @@ GET /api/v1/tasks/available?project_id=tree-app&user_trust=5&user_role=trusted
       "confidence_score": 42.0,
       "review_tier": "expert_review",
       "required_validations": {
-        "min_validators": 1,
+        "threshold_score": 3,
+        "role_weights": {"expert": 3},
         "required_min_trust": 7,
-        "required_role": "expert",
         "review_tier": "expert_review"
       },
       "submitted_at": "2026-03-10T18:00:00Z"
@@ -629,3 +643,311 @@ GET /api/v1/results?project_id=tree-app&status=pending_finalization&page=1&per_p
 7. **Trust Advisor as recommendation:** The `trust_adjustment` returned in the finalization response is advisory. Laravel owns the `trust_level` field and has the final say on whether to apply the delta. This avoids dual-write consistency issues.
 
 8. **Data corrections:** If the original data in Laravel is corrected after submission, the client should send a **new submission** to Winnow with the corrected data. The old submission and its score remain as an immutable historical record. Winnow stores submissions, not entities.
+
+---
+
+## 9. Governance Engine — Multi-Vote Flow (Sprint 2.5)
+
+> **Architecture Pivot:** Winnow no longer delegates vote collection to the client. Instead of the client sending a single `PATCH /final-status`, individual reviewers submit votes to Winnow via a dedicated endpoint. Winnow tracks votes, enforces duplicate-vote prevention, evaluates accumulated votes against the submission's `required_validations`, and automatically transitions the submission's status when the governance threshold is met.
+
+### 9.1 Voting Endpoint
+
+```
+POST /api/v1/submissions/{submission_id}/votes
+Content-Type: application/json
+```
+
+#### Request Body
+
+```json
+{
+  "user_id": "d4e5f6a7-b8c9-0d1e-2f3a-4b5c6d7e8f90",
+  "vote": "approve",
+  "user_trust_level": 65,
+  "user_role": "citizen",
+  "note": "Measurement looks consistent with the photos."
+}
+```
+
+#### Request Schema (Conceptual)
+
+```python
+class VoteRequest(BaseModel):
+    user_id: UUID
+    vote: Literal["approve", "reject"]
+    user_trust_level: int = Field(ge=0)     # reviewer's current trust level (from wire)
+    user_role: str = Field(min_length=1)    # reviewer's role in the client system
+    note: str | None = None                 # optional reviewer comment
+```
+
+#### Response (201 Created — vote accepted, threshold NOT yet met)
+
+```json
+{
+  "submission_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "vote_registered": true,
+  "current_votes": {
+    "approve": 1,
+    "reject": 0
+  },
+  "threshold_met": false,
+  "final_status": null,
+  "message": "Vote recorded. 1 more approval(s) needed."
+}
+```
+
+#### Response (201 Created — vote accepted, threshold MET → auto-finalization triggered)
+
+```json
+{
+  "submission_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "vote_registered": true,
+  "current_votes": {
+    "approve": 2,
+    "reject": 0
+  },
+  "threshold_met": true,
+  "final_status": "approved",
+  "message": "Threshold met. Submission finalized as 'approved'. Webhook notification queued."
+}
+```
+
+#### Response Schema (Conceptual)
+
+```python
+class VoteTally(BaseModel):
+    approve: int = Field(ge=0)
+    reject: int = Field(ge=0)
+
+class VoteResponse(BaseModel):
+    submission_id: UUID
+    vote_registered: bool
+    current_votes: VoteTally
+    threshold_met: bool
+    final_status: Literal["approved", "rejected"] | None
+    message: str
+```
+
+#### Error Responses
+
+| HTTP Status | `type` suffix | When |
+|---|---|---|
+| `404` | `/errors/submission-not-found` | `submission_id` does not exist. |
+| `409` | `/errors/duplicate-vote` | The same `user_id` has already voted on this submission. |
+| `409` | `/errors/already-finalized` | The submission has already reached a terminal status. |
+| `403` | `/errors/not-eligible` | The reviewer does not meet the trust/role requirements for this submission. |
+| `422` | `/errors/validation-error` | Request body validation failure. |
+
+### 9.2 Threshold Evaluation Logic — Role-Weights Pattern (Dynamic Governance)
+
+Winnow evaluates accumulated votes using a **role-weights accumulation** model. Instead of a
+flat `min_validators` count, each tier carries a `threshold_score` and a `role_weights` dict.
+The voting service sums `role_weights[voter_role]` for all eligible votes; when the accumulated
+weight meets `threshold_score`, the submission is auto-finalised.
+
+This eliminates all hardcoded role checks from the service layer — the service is purely
+math-agnostic (Rule 3: Configuration is King).
+
+```
+Given:
+  - required = submission.required_validations  (RequiredValidations)
+  - votes    = all votes for this submission     (list[Vote])
+
+# A vote is eligible if it passes both gates:
+#   1. trust gate  : v.user_trust_level >= required.required_min_trust
+#   2. weight gate : required.role_weights.get(v.user_role, 0) > 0
+
+approve_weight = SUM(
+    required.role_weights[v.user_role]
+    for v in votes
+    if v.vote == "approve"
+    AND v.user_trust_level >= required.required_min_trust
+    AND required.role_weights.get(v.user_role, 0) > 0
+)
+
+reject_weight = SUM(
+    required.role_weights[v.user_role]
+    for v in votes
+    if v.vote == "reject"
+    AND v.user_trust_level >= required.required_min_trust
+    AND required.role_weights.get(v.user_role, 0) > 0
+)
+
+IF approve_weight >= required.threshold_score:
+    → finalize as "approved", trigger Trust Advisor, queue webhook
+ELIF reject_weight >= required.threshold_score:
+    → finalize as "rejected", trigger Trust Advisor, queue webhook
+ELSE:
+    → remain "pending_review", no action
+```
+
+> **"2 Citizens OR 1 Expert" example (community_review tier):**
+> `threshold_score=2, role_weights={"citizen": 1, "expert": 2}, required_min_trust=50`
+>
+> - Two citizen approvals: 1 + 1 = 2 ≥ threshold_score → approved ✓
+> - One expert approval:   2     = 2 ≥ threshold_score → approved ✓
+> - One citizen + one low-trust voter: only the eligible citizen contributes weight=1 < 2 → pending
+>
+> The "OR" logic is expressed **entirely through the registry configuration** (role_weights values)
+> — no conditional branches in the service layer whatsoever.
+
+### 9.3 Superseded Status — Dedicated Endpoint
+
+The old `PATCH /final-status` route has been **renamed and narrowed** to `PATCH /supersede`
+(see §3b). The client (Laravel) uses it when a user corrects data and a new submission replaces
+the old one. Voting-driven finalisation (`approved`/`rejected`) is handled entirely by the voting
+endpoint — the client **never** sends these statuses directly.
+
+```
+PATCH /api/v1/submissions/{submission_id}/supersede
+Content-Type: application/json
+
+{
+  "status": "superseded",
+  "superseded_by": "new-submission-uuid"
+}
+```
+
+> **Schema guard:** `status` is `Literal["superseded"]` — the Pydantic schema rejects any other
+> value with 422, making it impossible to accidentally approve or reject via this endpoint.
+
+---
+
+## 10. Webhook Callback — Event-Driven Finalization Notification
+
+When Winnow automatically transitions a submission to a terminal state (`approved` or `rejected`) via vote threshold evaluation, it notifies the client (Laravel) asynchronously via an HTTP webhook callback.
+
+### 10.1 Webhook Payload
+
+```
+POST {client_webhook_url}
+Content-Type: application/json
+X-Winnow-Event: submission.finalized
+X-Winnow-Delivery: "unique-delivery-uuid"
+```
+
+```json
+{
+  "event": "submission.finalized",
+  "delivery_id": "unique-delivery-uuid",
+  "timestamp": "2026-03-11T09:15:00Z",
+  "payload": {
+    "submission_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "project_id": "tree-app",
+    "final_status": "approved",
+    "confidence_score": 67.5,
+    "trust_adjustment": {
+      "user_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+      "recommended_delta": 2,
+      "reason": "Submission approved",
+      "current_trust_level": 50,
+      "project_min_trust": 0,
+      "project_max_trust": 100
+    },
+    "vote_summary": {
+      "approve": 2,
+      "reject": 0,
+      "total": 2
+    }
+  }
+}
+```
+
+### 10.2 Webhook Response Contract
+
+The client must respond with `2xx` to acknowledge receipt. Any non-2xx response (or timeout) is treated as a delivery failure and triggers the retry mechanism.
+
+### 10.3 Guaranteed Delivery — Transactional Outbox Pattern
+
+Networks are unreliable. Winnow uses a **Transactional Outbox** pattern to guarantee webhook delivery:
+
+```mermaid
+sequenceDiagram
+    participant VotingService
+    participant DB as Winnow DB
+    participant OutboxWorker as Outbox Worker
+    participant Client as Laravel (Webhook URL)
+
+    Note over VotingService,DB: Step 1 — Atomic state change + outbox insert
+    VotingService->>DB: BEGIN TRANSACTION
+    VotingService->>DB: UPDATE submission SET status = 'approved'
+    VotingService->>DB: INSERT INTO webhook_outbox (event_payload, status='pending')
+    VotingService->>DB: COMMIT
+
+    Note over OutboxWorker,Client: Step 2 — Async delivery with retries
+    OutboxWorker->>DB: SELECT * FROM webhook_outbox WHERE status = 'pending'
+    OutboxWorker->>Client: POST {webhook_url} {event_payload}
+    alt Client responds 2xx
+        OutboxWorker->>DB: UPDATE webhook_outbox SET status = 'delivered'
+    else Client down or 5xx
+        OutboxWorker->>DB: UPDATE webhook_outbox SET status = 'failed', next_retry_at = now() + backoff
+        Note over OutboxWorker: Exponential backoff: 30s → 1m → 2m → 5m → 15m → 1h (max)
+    end
+```
+
+#### Outbox Entry States
+
+| Status | Meaning |
+|---|---|
+| `pending` | Inserted atomically with the state change. Awaiting first delivery attempt. |
+| `in_progress` | Currently being sent by the outbox worker. Prevents duplicate delivery by concurrent workers. |
+| `delivered` | Client acknowledged receipt (2xx). Terminal state. |
+| `failed` | Last attempt failed. Will be retried at `next_retry_at`. |
+| `dead_letter` | Exceeded maximum retry attempts. Requires manual intervention. |
+
+#### Retry Strategy
+
+- **Exponential backoff** with jitter to avoid thundering herd.
+- **Maximum retry attempts** configurable per project (default from `ProjectConfig`).
+- After max retries, the entry moves to `dead_letter` status and an alert is logged.
+- A background worker (or async task) polls the outbox table periodically.
+
+> **Why Transactional Outbox over direct HTTP call?** If Winnow finalizes the submission and then the webhook HTTP call fails, the submission is finalized but the client is never notified — an inconsistent state. The outbox pattern ensures the webhook event is created **atomically** with the state change (same DB transaction), guaranteeing that every finalization produces a delivery attempt.
+
+---
+
+## 11. Updated Data Flow — Full Lifecycle with Voting & Webhooks
+
+```mermaid
+sequenceDiagram
+    participant User as Citizen Scientist
+    participant Laravel as Laravel Tree-App
+    participant Winnow as Winnow (FastAPI)
+    participant WinnowDB as Winnow PostgreSQL
+
+    rect rgb(230, 243, 255)
+    Note over User,WinnowDB: Phase 1 — Submission & Scoring
+    User->>Laravel: Submit tree measurement via form
+    Laravel->>Winnow: POST /api/v1/submissions {envelope}
+    Winnow->>WinnowDB: Persist submission + scoring result (pending_review)
+    Winnow-->>Laravel: 201 {confidence_score, breakdown, required_validations}
+    Laravel-->>User: Show preliminary result + review requirements
+    end
+
+    rect rgb(230, 255, 230)
+    Note over User,WinnowDB: Phase 2 — Multi-Vote Collection & Auto-Finalization
+    User->>Laravel: Reviewer opens review queue
+    Laravel->>Winnow: GET /api/v1/tasks/available?project_id=tree-app&user_trust=65&user_role=citizen
+    Winnow-->>Laravel: 200 {tasks: [...eligible submissions...]}
+    Laravel-->>User: Render eligible review tasks
+
+    User->>Laravel: Reviewer approves submission
+    Laravel->>Winnow: POST /api/v1/submissions/{id}/votes {user_id, vote: "approve", trust: 65}
+    Winnow->>WinnowDB: INSERT vote + evaluate threshold
+    alt Threshold NOT met
+        Winnow-->>Laravel: 201 {threshold_met: false, message: "1 more needed"}
+    else Threshold MET → auto-finalize
+        Winnow->>WinnowDB: UPDATE status → approved + INSERT webhook_outbox
+        Winnow-->>Laravel: 201 {threshold_met: true, final_status: "approved"}
+    end
+    end
+
+    rect rgb(255, 243, 230)
+    Note over User,WinnowDB: Phase 3 — Webhook Notification (Async)
+    Winnow->>Winnow: Outbox worker picks up pending webhook
+    Winnow->>Laravel: POST {webhook_url} {submission.finalized, trust_adjustment}
+    Laravel->>Laravel: Apply trust delta to users.trust_level
+    Laravel-->>Winnow: 200 OK (acknowledged)
+    Winnow->>WinnowDB: UPDATE webhook_outbox SET status = 'delivered'
+    end
+```

@@ -17,12 +17,13 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from app.api.v1 import finalization, health, results, submissions, tasks
+from app.api.v1 import health, results, submissions, supersede, tasks, voting
 
 v1_router = APIRouter(prefix="/api/v1")
 
 v1_router.include_router(health.router)
 v1_router.include_router(submissions.router)
-v1_router.include_router(finalization.router)
+v1_router.include_router(supersede.router)
+v1_router.include_router(voting.router)
 v1_router.include_router(tasks.router)
 v1_router.include_router(results.router)
