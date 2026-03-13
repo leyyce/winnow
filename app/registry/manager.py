@@ -71,16 +71,54 @@ class Registry:
     def __init__(self) -> None:
         self._entries: dict[str, ProjectRegistryEntry] = {}
 
-    def load(self, builder: "ProjectBuilder") -> None:
+    def load(self, builder: "ProjectBuilder", *, allow_overwrite: bool = False) -> None:
         """
         Build and register a project using the provided ``ProjectBuilder``.
-        Calling ``load`` a second time with the same ``project_id`` overwrites
-        the previous entry (idempotent re-registration is safe during tests).
-        """
-        self._entries[builder.project_id] = builder.build()
 
-    def register(self, project_id: str, entry: ProjectRegistryEntry) -> None:
-        """Low-level registration — prefer ``load(builder)`` for new projects."""
+        Parameters
+        ----------
+        builder:
+            A ``ProjectBuilder`` whose ``build()`` method assembles the full
+            ``ProjectRegistryEntry``.
+        allow_overwrite:
+            If ``False`` (default) and a project with the same ``project_id``
+            is already registered, raises ``ValueError`` to prevent silent
+            double-registration at bootstrap time (§2.1 collision guard).
+            Set to ``True`` in test fixtures that re-register the same project
+            across multiple test cases for idempotency.
+        """
+        self.register(builder.project_id, builder.build(), allow_overwrite=allow_overwrite)
+
+    def register(
+        self,
+        project_id: str,
+        entry: ProjectRegistryEntry,
+        *,
+        allow_overwrite: bool = False,
+    ) -> None:
+        """
+        Low-level registration — prefer ``load(builder)`` for new projects.
+
+        Parameters
+        ----------
+        project_id:
+            Unique string identifier for the project (matches the value in
+            ``UNIQUE(project_id)`` on the ``project_configs`` DB table).
+        entry:
+            Fully assembled ``ProjectRegistryEntry`` to store.
+        allow_overwrite:
+            Controls collision behaviour.  ``False`` by default so that
+            production bootstrap calls fail loudly on duplicate IDs rather
+            than silently clobbering an existing registration.  Pass
+            ``allow_overwrite=True`` in test fixtures that need idempotent
+            re-registration.  See docs/architecture/05_database_design.md §2.1.
+        """
+        if not allow_overwrite and project_id in self._entries:
+            raise ValueError(
+                f"Project {project_id!r} is already registered. "
+                "Pass allow_overwrite=True to replace it intentionally "
+                "(e.g. in test fixtures), or check for duplicate bootstrap calls."
+            )
         self._entries[project_id] = entry
 
     def get_config(self, project_id: str) -> ProjectRegistryEntry:

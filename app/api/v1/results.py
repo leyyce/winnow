@@ -1,23 +1,23 @@
 """
-Results endpoint — GET /api/v1/results/{id}.
+Results endpoint — GET /api/v1/results/{submission_id}.
 
-Stub: raises ``NotImplementedYetError`` (→ 501 RFC 7807 response) until the
-DB persistence layer is added. Once the DB layer is in place this endpoint
-will return the stored ``ScoringResultResponse`` for the given submission UUID.
+Returns the stored ``ScoringResultResponse`` for the given submission UUID.
+Previously a 501 stub — now backed by the DB persistence layer (Sprint 3).
 
 References
 ----------
 * API contract: docs/architecture/03_api_contracts.md §7
 """
-
 from __future__ import annotations
 
 from uuid import UUID
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import NotImplementedYetError
+from app.api.deps import get_db
 from app.schemas.results import ScoringResultResponse
+from app.services import scoring_service
 
 router = APIRouter(tags=["results"])
 
@@ -29,9 +29,12 @@ router = APIRouter(tags=["results"])
     summary="Retrieve scoring result by submission ID",
     description=(
         "Returns the stored ``ScoringResultResponse`` for the given submission UUID. "
-        "Requires the DB persistence layer (Phase 2)."
+        "Returns 404 if the submission is not found."
     ),
 )
-async def get_result(submission_id: UUID) -> ScoringResultResponse:
-    """Stub — raises NotImplementedYetError until the DB layer is implemented."""
-    raise NotImplementedYetError(f"GET /api/v1/results/{submission_id}")
+async def get_result(
+    submission_id: UUID,
+    db: AsyncSession = Depends(get_db),
+) -> ScoringResultResponse:
+    """Return the persisted scoring result for the given submission."""
+    return await scoring_service.get_submission_result(submission_id, db)

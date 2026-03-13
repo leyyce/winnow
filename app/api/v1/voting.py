@@ -14,8 +14,10 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.deps import get_db
 from app.schemas.voting import VoteRequest, VoteResponse
 from app.services import voting_service
 
@@ -36,6 +38,7 @@ router = APIRouter(tags=["voting"])
 async def cast_vote(
     submission_id: UUID,
     request: VoteRequest,
+    db: AsyncSession = Depends(get_db),
 ) -> VoteResponse:
     """Record a vote and return the current voting state."""
-    return await voting_service.cast_vote(submission_id, request)
+    return await voting_service.cast_vote(submission_id, request, db)

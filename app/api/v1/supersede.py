@@ -26,8 +26,10 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.deps import get_db
 from app.schemas.supersede import SupersedeRequest, SupersedeResponse
 from app.services import scoring_service
 
@@ -50,6 +52,7 @@ router = APIRouter(tags=["submissions"])
 async def supersede_submission(
     submission_id: UUID,
     request: SupersedeRequest,
+    db: AsyncSession = Depends(get_db),
 ) -> SupersedeResponse:
     """Retire a submission and record the UUID of the replacement."""
-    return await scoring_service.supersede_submission(submission_id, request)
+    return await scoring_service.supersede_submission(submission_id, request, db)

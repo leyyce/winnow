@@ -13,8 +13,9 @@ from uuid import uuid4
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.services import voting_service, webhook_service
+from app.services import webhook_service
 from app.tests.conftest import _ctx, _payload
 
 
@@ -66,15 +67,6 @@ async def _submit_and_get_id(client: AsyncClient) -> str:
     response = await client.post("/api/v1/submissions", json=_valid_envelope())
     assert response.status_code == 201
     return response.json()["submission_id"]
-
-
-# ── Fixtures ──────────────────────────────────────────────────────────────────
-
-@pytest.fixture(autouse=True)
-def _clean_stores() -> None:
-    """Reset in-memory stores before each test to prevent cross-contamination."""
-    voting_service.clear_store()
-    webhook_service.clear_outbox()
 
 
 # ── POST /submissions/{id}/votes — happy path ────────────────────────────────
@@ -256,20 +248,26 @@ async def test_vote_invalid_vote_value_returns_422(async_client: AsyncClient) ->
 
 # ── Webhook outbox integration ────────────────────────────────────────────────
 
-async def test_vote_finalization_creates_outbox_entry(async_client: AsyncClient) -> None:
-    """When threshold is met, a webhook outbox entry must be created."""
+async def test_vote_finalization_creates_outbox_entry(
+    async_client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    """When threshold is met, a webhook outbox entry must be created in the DB."""
     sid = await _submit_and_get_id(async_client)
 
+    # First citizen vote — weight=1, threshold=2, not met yet
     await async_client.post(
         f"/api/v1/submissions/{sid}/votes",
         json=_vote_body(trust=50),
     )
+    # Second citizen vote (different user_id) — weight=2, threshold met → outbox entry
     await async_client.post(
         f"/api/v1/submissions/{sid}/votes",
         json=_vote_body(trust=50),
     )
 
-    pending = webhook_service.get_pending_entries()
+    # Query DB directly — db_session shares the same SQLite engine as async_client
+    pending = await webhook_service.get_pending_entries(db_session)
     assert len(pending) == 1
     assert str(pending[0].submission_id) == sid
     assert pending[0].event_type == "submission.finalized"

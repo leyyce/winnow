@@ -1,25 +1,31 @@
 """
-Voting service — application-layer orchestrator for the multi-vote governance flow.
+Voting service — DB-backed multi-vote governance orchestrator.
 
-Accepts individual reviewer votes, enforces eligibility and duplicate-vote
-prevention, evaluates accumulated votes against governance thresholds, and
-triggers auto-finalization + webhook queuing when the threshold is met.
+Replaces the Sprint 2.6 in-memory ``_submissions`` dict with real
+SQLAlchemy async queries.  All writes within ``cast_vote`` — the vote
+INSERT, the optional status UPDATE, and the optional webhook outbox INSERT —
+are performed in the *same* ``AsyncSession`` transaction so they commit or
+roll back atomically (ADR-DB-006 / Rule 11).
 
-All persistence is via in-memory dicts (stubs) until the DB layer is added
-in Sprint 3.
+``SELECT … FOR UPDATE`` on the Submission row prevents two concurrent votes
+from racing to finalize the same submission (ADR-DB-004).  SQLite (used in
+tests) silently ignores ``FOR UPDATE``, which is safe because SQLite
+serialises writes at the table level.
 
 References
 ----------
 * Architecture: docs/architecture/03_api_contracts.md §9
-* Database design: docs/architecture/05_database_design.md (submission_votes table)
+* Database:     docs/architecture/05_database_design.md §6 step 9
+* Rule 9:       Services never import fastapi / never raise HTTPException
+* Rule 11:      Event-driven state transitions via Transactional Outbox
 """
-
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from uuid import UUID
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import (
     AlreadyFinalizedError,
@@ -27,122 +33,74 @@ from app.core.exceptions import (
     NotEligibleError,
     SubmissionNotFoundError,
 )
+from app.models.scoring_result import ScoringResult
+from app.models.submission import Submission, SubmissionStatus
+from app.models.submission_vote import SubmissionVote
 from app.registry.manager import registry
-from app.schemas.results import RequiredValidations, ScoringResultResponse
+from app.schemas.results import RequiredValidations
 from app.schemas.voting import VoteRequest, VoteResponse, VoteTally
 from app.services import webhook_service
 
 logger = logging.getLogger(__name__)
 
 
-# ── In-memory vote store (stub until Sprint 3 DB layer) ──────────────────────
-
-@dataclass(frozen=True)
-class StoredVote:
-    """In-memory representation of a single recorded vote."""
-
-    user_id: UUID
-    vote: str           # "approve" or "reject"
-    user_trust_level: int
-    user_role: str
-    note: str | None
-    created_at: datetime
-
-
-@dataclass
-class SubmissionRecord:
-    """
-    In-memory representation of a submission with its scoring result and votes.
-
-    This stub replaces DB queries until Sprint 3. The ``scoring_result`` is
-    the full ScoringResultResponse returned at submission time. Votes are
-    appended as they arrive.
-    """
-
-    scoring_result: ScoringResultResponse
-    status: str = "pending_review"
-    votes: list[StoredVote] = field(default_factory=list)
-    # Set of user_ids who have already voted (fast duplicate check)
-    voter_ids: set[UUID] = field(default_factory=set)
-
-
-# Global in-memory store: submission_id → SubmissionRecord
-_submissions: dict[UUID, SubmissionRecord] = {}
-
-
-# ── Public API ────────────────────────────────────────────────────────────────
-
-def register_submission(result: ScoringResultResponse) -> None:
-    """
-    Register a scored submission in the in-memory store for vote tracking.
-
-    Called by the submission service after scoring completes. In Sprint 3
-    this will be replaced by the DB INSERT in the same transaction.
-    """
-    _submissions[result.submission_id] = SubmissionRecord(
-        scoring_result=result,
-        status="pending_review",
-    )
-
-
-def get_submission_record(submission_id: UUID) -> SubmissionRecord | None:
-    """Look up a submission record by ID. Returns None if not found."""
-    return _submissions.get(submission_id)
-
-
-def clear_store() -> None:
-    """Reset the in-memory store. Used by tests only."""
-    _submissions.clear()
-
-
 async def cast_vote(
     submission_id: UUID,
     request: VoteRequest,
+    db: AsyncSession,
 ) -> VoteResponse:
     """
     Record a reviewer's vote and evaluate governance thresholds.
 
     Steps
     -----
-    1. Look up submission (SubmissionNotFoundError if missing).
-    2. Check submission is still in ``pending_review`` (AlreadyFinalizedError if not).
-    3. Check reviewer eligibility via governance policy (NotEligibleError if ineligible).
-    4. Check for duplicate vote (DuplicateVoteError if already voted).
-    5. Record the vote.
-    6. Evaluate threshold — if met, auto-finalize and queue webhook.
-    7. Return VoteResponse.
+    1. SELECT submission WITH FOR UPDATE (SubmissionNotFoundError if missing).
+    2. Check submission is still ``pending_review`` (AlreadyFinalizedError if not).
+    3. Load ScoringResult → deserialise RequiredValidations.
+    4. Check reviewer eligibility via governance policy (NotEligibleError if ineligible).
+    5. Check for duplicate vote via DB UNIQUE index (DuplicateVoteError if exists).
+    6. INSERT SubmissionVote + flush.
+    7. Load all votes → compute weighted tally.
+    8. If threshold met: UPDATE submission.status + INSERT WebhookOutbox (same tx).
+    9. Return VoteResponse.
+
+    All DB writes in steps 6–8 share the same ``AsyncSession`` and commit
+    atomically when the ``get_db`` dependency finalises the transaction.
 
     Raises
     ------
-    SubmissionNotFoundError
-        If ``submission_id`` is not in the store.
-    AlreadyFinalizedError
-        If the submission has already been finalized.
-    NotEligibleError
-        If the reviewer does not meet trust/role requirements.
+    SubmissionNotFoundError, AlreadyFinalizedError, NotEligibleError,
     DuplicateVoteError
-        If the same ``user_id`` has already voted on this submission.
     """
-    # Step 1 — look up submission
-    record = _submissions.get(submission_id)
-    if record is None:
+    # Step 1 — load submission with row-level lock (no-op on SQLite)
+    stmt = (
+        select(Submission)
+        .where(Submission.submission_id == submission_id)
+        .with_for_update()
+    )
+    submission = (await db.execute(stmt)).scalar_one_or_none()
+    if submission is None:
         raise SubmissionNotFoundError(submission_id)
 
-    # Step 2 — check submission is still pending
-    if record.status != "pending_review":
-        raise AlreadyFinalizedError(submission_id, record.status)
+    # Step 2 — must still be pending
+    if submission.status != SubmissionStatus.PENDING_REVIEW:
+        raise AlreadyFinalizedError(submission_id, submission.status)
 
-    # Step 3 — check reviewer eligibility
-    required = record.scoring_result.required_validations
-    config = registry.get_config(record.scoring_result.project_id)
+    # Step 3 — load governance snapshot from scoring_results
+    sr_stmt = select(ScoringResult).where(ScoringResult.submission_id == submission_id)
+    sr_row = (await db.execute(sr_stmt)).scalar_one()
+    required = RequiredValidations.model_validate(sr_row.required_validations)
+
+    # Step 4 — check reviewer eligibility
+    config = registry.get_config(submission.project_id)
     is_eligible = config.governance_policy.is_eligible_reviewer(
-        submission_score=record.scoring_result.confidence_score,
+        submission_score=submission.confidence_score,
         submission_requirements=required,
         reviewer_trust=request.user_trust_level,
         reviewer_role=request.user_role,
     )
     if not is_eligible:
-        reasons = []
+        reasons: list[str] = []
         if request.user_trust_level < required.required_min_trust:
             reasons.append(
                 f"trust_level {request.user_trust_level} < required {required.required_min_trust}"
@@ -153,21 +111,26 @@ async def cast_vote(
             )
         raise NotEligibleError("; ".join(reasons) or "does not meet requirements")
 
-    # Step 4 — check for duplicate vote
-    if request.user_id in record.voter_ids:
+    # Step 5 — duplicate-vote check (DB UNIQUE constraint is the final guard)
+    dup_stmt = select(SubmissionVote).where(
+        SubmissionVote.submission_id == submission_id,
+        SubmissionVote.user_id == request.user_id,
+    )
+    existing_vote = (await db.execute(dup_stmt)).scalar_one_or_none()
+    if existing_vote is not None:
         raise DuplicateVoteError(submission_id, request.user_id)
 
-    # Step 5 — record the vote
-    vote = StoredVote(
+    # Step 6 — persist the vote
+    vote_row = SubmissionVote(
+        submission_id=submission_id,
         user_id=request.user_id,
         vote=request.vote,
         user_trust_level=request.user_trust_level,
         user_role=request.user_role,
         note=request.note,
-        created_at=datetime.now(timezone.utc),
     )
-    record.votes.append(vote)
-    record.voter_ids.add(request.user_id)
+    db.add(vote_row)
+    await db.flush()
 
     logger.info(
         "Vote recorded",
@@ -178,16 +141,19 @@ async def cast_vote(
         },
     )
 
-    # Step 6 — evaluate threshold using accumulated role-weights
-    tally = _compute_tally(record.votes)
-    threshold_result = _evaluate_threshold(required, record.votes)
+    # Step 7 — load all votes and compute tally
+    all_votes_stmt = select(SubmissionVote).where(
+        SubmissionVote.submission_id == submission_id
+    )
+    all_votes = (await db.execute(all_votes_stmt)).scalars().all()
+    tally = _compute_tally(all_votes)
+
+    # Step 8 — evaluate threshold
+    threshold_result = _evaluate_threshold(required, all_votes)
 
     if threshold_result is not None:
-        # Auto-finalize
-        record.status = threshold_result
-        record.scoring_result = record.scoring_result.model_copy(
-            update={"status": threshold_result},
-        )
+        submission.status = threshold_result
+        await db.flush()
 
         logger.info(
             "Threshold met — auto-finalizing",
@@ -199,14 +165,15 @@ async def cast_vote(
             },
         )
 
-        # Queue webhook (async, best-effort in stub mode)
+        # Queue outbox entry within the same transaction (Transactional Outbox)
         await webhook_service.queue_finalization_webhook(
             submission_id=submission_id,
-            project_id=record.scoring_result.project_id,
+            project_id=submission.project_id,
             final_status=threshold_result,
-            confidence_score=record.scoring_result.confidence_score,
-            user_context=None,  # will be resolved from DB in Sprint 3
+            confidence_score=submission.confidence_score,
+            user_context=submission.user_context,
             tally=tally,
+            db=db,
         )
 
         return VoteResponse(
@@ -217,15 +184,14 @@ async def cast_vote(
             final_status=threshold_result,
             message=(
                 f"Threshold met. Submission finalized as '{threshold_result}'. "
-                f"Webhook notification queued."
+                "Webhook notification queued."
             ),
         )
 
-    # Step 7 — threshold not met, return current state
-    approve_score = _compute_weighted_score(required, record.votes, "approve")
-    reject_score = _compute_weighted_score(required, record.votes, "reject")
+    # Step 9 — threshold not yet met
+    approve_score = _compute_weighted_score(required, all_votes, "approve")
+    reject_score = _compute_weighted_score(required, all_votes, "reject")
     remaining = required.threshold_score - max(approve_score, reject_score)
-
     return VoteResponse(
         submission_id=submission_id,
         vote_registered=True,
@@ -237,8 +203,10 @@ async def cast_vote(
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
+# These helpers work on SubmissionVote ORM rows (same field names as the old
+# StoredVote dataclass: vote, user_trust_level, user_role, user_id).
 
-def _compute_tally(votes: list[StoredVote]) -> VoteTally:
+def _compute_tally(votes: list[SubmissionVote]) -> VoteTally:
     """Count approve and reject votes (all votes, regardless of eligibility)."""
     approve = sum(1 for v in votes if v.vote == "approve")
     reject = sum(1 for v in votes if v.vote == "reject")
@@ -247,20 +215,19 @@ def _compute_tally(votes: list[StoredVote]) -> VoteTally:
 
 def _compute_weighted_score(
     required: RequiredValidations,
-    votes: list[StoredVote],
+    votes: list[SubmissionVote],
     decision: str,
 ) -> int:
     """
     Sum the role-weights of all eligible votes matching ``decision``.
 
-    A vote contributes its role-weight when:
+    A vote is eligible when:
     - ``vote == decision``
     - ``user_trust_level >= required.required_min_trust``
-    - ``required.role_weights.get(user_role, 0) > 0``  (role has positive weight)
+    - ``role_weights.get(user_role, 0) > 0``
 
-    This replaces the old count-based ``_count_eligible`` helper with a
-    weight-accumulation approach, making the service layer value-agnostic
-    (Rule 3: Configuration is King — all weights live in the registry).
+    All weights come from ``RequiredValidations`` (snapshotted from the
+    project config at submission time) — no magic numbers here (Rule 3).
     """
     return sum(
         required.role_weights.get(v.user_role, 0)
@@ -273,27 +240,17 @@ def _compute_weighted_score(
 
 def _evaluate_threshold(
     required: RequiredValidations,
-    votes: list[StoredVote],
+    votes: list[SubmissionVote],
 ) -> str | None:
     """
     Evaluate whether accumulated role-weight meets the governance threshold.
 
-    Returns
-    -------
-    str | None
-        ``"approved"`` if approve_weight >= threshold_score,
-        ``"rejected"`` if reject_weight >= threshold_score,
-        or ``None`` if neither threshold is met.
-
-    Approval is checked first — if both thresholds are met simultaneously
-    (unlikely but possible in edge cases), approval wins.
+    Returns ``"approved"``, ``"rejected"``, or ``None`` if no threshold met.
+    Approval is evaluated first — if both thresholds are met simultaneously
+    (edge case with large role-weights), approval wins.
     """
-    approve_score = _compute_weighted_score(required, votes, "approve")
-    if approve_score >= required.threshold_score:
-        return "approved"
-
-    reject_score = _compute_weighted_score(required, votes, "reject")
-    if reject_score >= required.threshold_score:
-        return "rejected"
-
+    if _compute_weighted_score(required, votes, "approve") >= required.threshold_score:
+        return SubmissionStatus.APPROVED
+    if _compute_weighted_score(required, votes, "reject") >= required.threshold_score:
+        return SubmissionStatus.REJECTED
     return None

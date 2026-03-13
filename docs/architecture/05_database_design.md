@@ -2,6 +2,8 @@
 
 > Comprehensive planning document for Winnow's PostgreSQL persistence layer (Sprint 3).
 > **No implementation code is included.** This document defines the schema, analyses edge cases, and records architectural decisions that will guide the SQLAlchemy 2.0 + Alembic implementation.
+>
+> **Last updated:** Sprint 3 Phase 1 — all open "Proposed" ADRs resolved; schema synced with Sprint 2.6 governance engine (role-weights, `pending_review` status, `superseded_by` column, full 4-table migration plan).
 
 **Terminology reminder:** *"Validation"* = Stage 1 (Pydantic schema checks). *"Scoring"* = Stage 2 (Confidence Score factors). *"Trust Evaluation & Advisory"* = Stage 4 — dual role: (a) Tₙ as scoring input, (b) `trust_adjustment` recommendation after ground-truth finalization. See `01_project_structure.md` for the full convention.
 
@@ -20,7 +22,7 @@
 | **Configuration from Code, Not DB (Phase 1)** | For the thesis prototype, all project configurations live in `ProjectBuilder` classes. The `project_configs` table is reserved for Phase 2 (DB-backed registry). See `02_architecture_patterns.md` §3. |
 | **Timezone-Aware Timestamps** | All `TIMESTAMPTZ` columns — consistent with the `AwareDatetime` requirement enforced in Pydantic schemas. |
 
-### 1.2 Proposed Tables
+### 1.2 Table Definitions
 
 #### Table: `submissions`
 
@@ -38,11 +40,23 @@ The central table. Stores every envelope received by `POST /api/v1/submissions` 
 | `user_total_submissions` | `INTEGER` | `NOT NULL` | Cumulative submission count at submission time. |
 | `user_account_created_at` | `TIMESTAMPTZ` | `NOT NULL` | Account creation timestamp snapshot. |
 | `payload` | `JSONB` | `NOT NULL` | Raw domain data from the envelope. Stored as-is after Stage 1 validation passes. |
-| `status` | `VARCHAR` | `NOT NULL, DEFAULT 'pending_finalization'` | Lifecycle state: `'pending_finalization'`, `'approved'`, `'rejected'`. |
+| `status` | `VARCHAR` | `NOT NULL, DEFAULT 'pending_review', CHECK IN ('pending_review', 'approved', 'rejected', 'superseded')` | Lifecycle state. `pending_review` is the initial state for all new submissions entering the Governance Engine vote flow. See §1.2 — Status Lifecycle for a full description of each state. |
+| `superseded_by` | `UUID` | `NULL, FK → submissions.id` | Self-referential FK. Set when a submission is retired via `PATCH /supersede`. Points to the replacement submission's UUID. NULL for all other statuses. |
 | `client_version` | `VARCHAR` | `NULL` | Optional semver of the calling client. |
 | `submitted_at` | `TIMESTAMPTZ` | `NOT NULL` | Client-reported submission timestamp from the envelope. |
 | `created_at` | `TIMESTAMPTZ` | `NOT NULL, DEFAULT now()` | Server-side row creation timestamp. |
 | `updated_at` | `TIMESTAMPTZ` | `NOT NULL, DEFAULT now()` | Server-side last-modification timestamp (set on status transitions). |
+
+**Status lifecycle:**
+
+| Status | Description | Terminal? |
+|---|---|---|
+| `pending_review` | Initial state. Submission is scored and awaiting reviewer votes via the Governance Engine. | No |
+| `approved` | Auto-finalized by Governance Engine when accumulated approve-vote weight ≥ `threshold_score`. | Yes |
+| `rejected` | Auto-finalized by Governance Engine when accumulated reject-vote weight ≥ `threshold_score`. | Yes |
+| `superseded` | Retired by explicit client action (`PATCH /supersede`). Replaced by a corrected submission identified by `superseded_by`. Excluded from Trust Advisor calculations and review queues. | Yes |
+
+> **Note on `pending_finalization`:** The `ScoringResultResponse` Pydantic schema retains `pending_finalization` as a permitted status value for backward-compatibility with pre-Sprint-2.6 responses. It is not stored in the database for new submissions. All new rows use `pending_review`.
 
 **Design choice — flattened `user_context` columns vs. JSONB:**
 
@@ -54,6 +68,8 @@ The `user_context` fields are flattened into typed columns rather than stored as
 
 The `payload` column remains JSONB because its structure varies per project and per `submission_type`.
 
+---
+
 #### Table: `scoring_results`
 
 One-to-one relationship with `submissions`. Stores the output of the scoring pipeline and governance policy.
@@ -64,9 +80,9 @@ One-to-one relationship with `submissions`. Stores the output of the scoring pip
 | `submission_id` | `UUID` | `FK → submissions.id, UNIQUE, NOT NULL` | One scoring result per submission. |
 | `confidence_score` | `FLOAT` | `NOT NULL, CHECK (0 <= val <= 100)` | Final weighted Confidence Score (0–100 scale). |
 | `breakdown` | `JSONB` | `NOT NULL` | Array of `RuleBreakdown` objects: `[{rule, weight, score, weighted_score, details}]`. |
-| `required_validations` | `JSONB` | `NOT NULL` | Governance Target State: `{threshold_score, role_weights, required_min_trust, review_tier}`. Role-weights pattern (Sprint 2.5): `threshold_score` replaces `min_validators`; `role_weights` dict replaces `required_role`. |
-| `thresholds` | `JSONB` | `NOT NULL` | Snapshot of `ThresholdConfig` at scoring time: `{auto_approve_min, manual_review_min}`. |
-| `reviewed_by` | `VARCHAR` | `NULL` | Who made the finalization decision (set on `PATCH /final-status`). |
+| `required_validations` | `JSONB` | `NOT NULL` | Governance Target State snapshot: `{threshold_score, role_weights, required_min_trust, review_tier}`. `threshold_score` (int) is the minimum accumulated role-weight sum to trigger finalization. `role_weights` (dict[str, int]) maps reviewer role → weight per vote, replacing the old `min_validators`/`required_role` pattern. See `RequiredValidations` in `app/schemas/results.py`. |
+| `thresholds` | `JSONB` | `NOT NULL` | Snapshot of `ThresholdConfig` at scoring time: `{auto_approve_min, manual_review_min}` (both integers on the 0–100 scale). |
+| `reviewed_by` | `VARCHAR` | `NULL` | Identity of the last reviewer/actor that triggered finalization. Set on vote-threshold auto-finalization. |
 | `review_note` | `VARCHAR` | `NULL` | Optional explanation from the reviewer. |
 | `trust_adjustment` | `JSONB` | `NULL` | Trust Advisor output after finalization: `{user_id, recommended_delta, reason, ...}`. NULL until finalized. |
 | `finalized_at` | `TIMESTAMPTZ` | `NULL` | When the finalization signal was received. NULL until finalized. |
@@ -76,7 +92,7 @@ One-to-one relationship with `submissions`. Stores the output of the scoring pip
 
 Keeping scoring results in a separate table provides:
 
-1. **Separation of concerns.** The submission is the *input* (envelope snapshot); the scoring result is the *output* (computed artefacts). They have different write patterns — the submission row is write-once; the scoring result row is written once then updated on finalization.
+1. **Separation of concerns.** The submission is the *input* (envelope snapshot); the scoring result is the *output* (computed artefacts). They have different write patterns — the submission row is write-once (plus status transitions); the scoring result row is written once then updated on finalization.
 2. **Query flexibility.** Dashboard queries (`GET /results?status=...&score_gte=...`) can target `scoring_results` without loading heavy `payload` JSONB from `submissions`.
 3. **Future extensibility.** If re-scoring is ever introduced (Phase 2), multiple scoring results per submission become possible without schema changes — just relax the `UNIQUE` constraint.
 
@@ -90,9 +106,11 @@ These fields are stored as JSONB rather than normalised into child tables becaus
 
 If future analytics require cross-submission rule-level queries, a materialised view or ETL pipeline over the JSONB data is the recommended approach — not schema normalisation.
 
+---
+
 #### Table: `submission_votes`
 
-Stores individual reviewer votes. One row per (submission, voter) pair. Introduced in Sprint 2.5 (Governance Engine upgrade). See `03_api_contracts.md` §9 for the full voting flow.
+Stores individual reviewer votes. One row per (submission, voter) pair. Introduced in Sprint 2.6 (Governance Engine upgrade). See `03_api_contracts.md` §9 for the full voting flow.
 
 | Column | Type | Constraints | Description |
 |---|---|---|---|
@@ -111,8 +129,10 @@ Stores individual reviewer votes. One row per (submission, voter) pair. Introduc
 
 **Design notes:**
 - Votes are **immutable** — once cast, a vote cannot be changed or retracted. This preserves audit integrity.
-- The `user_trust_level` and `user_role` are snapshots at vote time, not live values. This ensures threshold evaluation uses the reviewer's state at the moment they voted.
-- Threshold evaluation uses the **role-weights pattern**: the voting service sums `role_weights[user_role]` for all eligible votes (trust gate + weight gate); finalisation triggers when the accumulated weight ≥ `threshold_score`. See `03_api_contracts.md` §9.2 for the full algorithm.
+- `user_trust_level` and `user_role` are snapshots at vote time (Data on the Wire pattern). Threshold evaluation always uses the reviewer's state at the moment they voted, not a live lookup.
+- Threshold evaluation uses the **role-weights pattern**: the voting service sums `role_weights[user_role]` for all eligible votes (trust gate + weight gate); finalization triggers when the accumulated weight ≥ `threshold_score`. See `03_api_contracts.md` §9.2 for the full algorithm.
+
+---
 
 #### Table: `webhook_outbox`
 
@@ -123,23 +143,25 @@ Implements the Transactional Outbox pattern for guaranteed webhook delivery. See
 | `id` | `UUID` | `PK, DEFAULT gen_random_uuid()` | Server-generated surrogate key. |
 | `submission_id` | `UUID` | `FK → submissions.id, NOT NULL` | The submission that triggered the webhook. |
 | `event_type` | `VARCHAR` | `NOT NULL` | Event identifier, e.g. `'submission.finalized'`. |
-| `payload` | `JSONB` | `NOT NULL` | Full webhook payload to deliver. |
-| `status` | `VARCHAR` | `NOT NULL, DEFAULT 'pending'` | Delivery state: `'pending'`, `'in_progress'`, `'delivered'`, `'failed'`, `'dead_letter'`. |
+| `payload` | `JSONB` | `NOT NULL` | Full `WebhookEvent` payload to deliver, serialized from `app/schemas/webhooks.py`. |
+| `status` | `VARCHAR` | `NOT NULL, DEFAULT 'pending', CHECK IN ('pending', 'in_progress', 'delivered', 'failed', 'dead_letter')` | Delivery state. Mirrors `OutboxStatus` in `app/services/webhook_service.py`. |
 | `attempts` | `INTEGER` | `NOT NULL, DEFAULT 0` | Number of delivery attempts made so far. |
-| `max_attempts` | `INTEGER` | `NOT NULL` | Maximum attempts before moving to `dead_letter`. From project config. |
+| `max_attempts` | `INTEGER` | `NOT NULL` | Maximum attempts before moving to `dead_letter`. Sourced from project config. |
 | `next_retry_at` | `TIMESTAMPTZ` | `NULL` | When the next retry should be attempted. NULL for `pending` and terminal states. |
 | `last_error` | `VARCHAR` | `NULL` | Error message from the most recent failed attempt. |
 | `created_at` | `TIMESTAMPTZ` | `NOT NULL, DEFAULT now()` | When the outbox entry was created. |
 | `updated_at` | `TIMESTAMPTZ` | `NOT NULL, DEFAULT now()` | Last modification timestamp. |
 
 **Design notes:**
-- The outbox entry is **inserted atomically** in the same DB transaction that finalizes the submission. This guarantees no finalization occurs without a corresponding webhook attempt.
-- The `in_progress` status prevents concurrent outbox workers from picking up the same entry.
+- The outbox entry is **inserted atomically** in the same DB transaction that finalizes the submission status and scoring result. This guarantees no finalization occurs without a corresponding webhook delivery attempt.
+- The `in_progress` status prevents concurrent outbox workers from picking up the same entry (acts as a distributed lock flag).
 - The `dead_letter` status is a terminal state requiring manual intervention or automated alerting.
+
+---
 
 #### Table: `project_configs` (Phase 2 — Future)
 
-Reserved for the DB-backed registry. Not implemented in Sprint 3.
+Reserved for the DB-backed registry. Not implemented in Sprint 3. For Phase 1, all project configurations are code-based and live in `ProjectBuilder` classes.
 
 | Column | Type | Constraints | Description |
 |---|---|---|---|
@@ -149,6 +171,8 @@ Reserved for the DB-backed registry. Not implemented in Sprint 3.
 | `is_active` | `BOOLEAN` | `NOT NULL, DEFAULT TRUE` | Soft-disable without deleting configuration. |
 | `created_at` | `TIMESTAMPTZ` | `NOT NULL, DEFAULT now()` | Row creation timestamp. |
 | `updated_at` | `TIMESTAMPTZ` | `NOT NULL, DEFAULT now()` | Last modification timestamp. |
+
+---
 
 ### 1.3 Entity-Relationship Diagram
 
@@ -165,7 +189,8 @@ erDiagram
         INTEGER user_total_submissions
         TIMESTAMPTZ user_account_created_at
         JSONB payload "project-specific domain data"
-        VARCHAR status "pending_finalization | approved | rejected"
+        VARCHAR status "pending_review | approved | rejected | superseded"
+        UUID superseded_by "nullable self-FK"
         VARCHAR client_version "nullable"
         TIMESTAMPTZ submitted_at
         TIMESTAMPTZ created_at
@@ -177,8 +202,8 @@ erDiagram
         UUID submission_id FK "unique"
         FLOAT confidence_score "0-100"
         JSONB breakdown "array of RuleBreakdown"
-        JSONB required_validations "governance Target State"
-        JSONB thresholds "snapshot of ThresholdConfig"
+        JSONB required_validations "threshold_score + role_weights dict"
+        JSONB thresholds "auto_approve_min + manual_review_min"
         VARCHAR reviewed_by "nullable, set on finalization"
         VARCHAR review_note "nullable"
         JSONB trust_adjustment "nullable, set on finalization"
@@ -210,7 +235,7 @@ erDiagram
         UUID id PK "server-generated"
         UUID submission_id FK
         VARCHAR event_type
-        JSONB payload "webhook body"
+        JSONB payload "serialized WebhookEvent"
         VARCHAR status "pending | in_progress | delivered | failed | dead_letter"
         INTEGER attempts
         INTEGER max_attempts
@@ -223,6 +248,7 @@ erDiagram
     submissions ||--|| scoring_results : "has one"
     submissions ||--o{ submission_votes : "has many"
     submissions ||--o{ webhook_outbox : "has many"
+    submissions |o--o| submissions : "superseded_by (self-ref)"
 ```
 
 ### 1.4 Index Strategy
@@ -231,7 +257,7 @@ erDiagram
 |---|---|---|---|
 | `submissions` | `ix_submissions_project_id` | B-Tree | Filter by project for task queries and dashboards. |
 | `submissions` | `ix_submissions_user_id` | B-Tree | Per-user history for Trust Advisor (`WHERE user_id = ? AND status IN ('approved', 'rejected')`). |
-| `submissions` | `ix_submissions_status_project` | B-Tree (composite) | `(project_id, status)` — the primary query path for `GET /tasks/available` (find `pending_finalization` submissions per project). |
+| `submissions` | `ix_submissions_status_project` | B-Tree (composite) | `(project_id, status)` — primary query path for `GET /tasks/available` (find `pending_review` submissions per project). |
 | `scoring_results` | `ix_scoring_results_submission_id` | B-Tree (unique) | FK lookup + enforce 1:1 relationship. Automatically created by the `UNIQUE` constraint. |
 | `scoring_results` | `ix_scoring_results_confidence_score` | B-Tree | Range queries for dashboards (`WHERE confidence_score >= X`). |
 | `submission_votes` | `uq_submission_votes_submission_user` | B-Tree (unique composite) | `(submission_id, user_id)` — enforces one vote per user per submission. Also serves as the primary lookup path. |
@@ -244,22 +270,6 @@ GIN indexes on `payload` or `breakdown` are **not** created initially. Rationale
 1. No current query path requires JSONB containment or key-existence operators on these columns.
 2. GIN indexes are expensive to maintain on write-heavy columns.
 3. If analytics queries emerge in Phase 2, targeted GIN indexes or expression indexes (e.g., on `payload->>'tree_id'`) can be added via Alembic migration without downtime.
-
-### 1.5 Challenge: Global Table vs. Per-Project Tables
-
-**Current plan:** A single global `submissions` table with `project_id` as a discriminator column.
-
-**Alternative considered:** One `submissions_<project>` table per project (e.g., `submissions_tree_app`).
-
-| Criterion | Global Table | Per-Project Tables |
-|---|---|---|
-| **Schema simplicity** | ✅ One table, one model, one migration | ❌ Dynamic table creation, dynamic ORM mapping |
-| **Cross-project queries** | ✅ Simple `SELECT ... WHERE project_id = ?` | ❌ Requires `UNION ALL` across N tables |
-| **Write isolation** | ❌ All projects share locks/vacuums | ✅ Independent vacuuming and bloat control |
-| **Prototype suitability** | ✅ Minimal complexity | ❌ Over-engineered for single-project thesis |
-| **Scaling path** | Partition by `project_id` when needed | Already partitioned by design |
-
-**Decision:** Global table for Phase 1. If Winnow serves many high-volume projects in production, PostgreSQL declarative table partitioning by `project_id` can be introduced transparently (the application code sees a single logical table). This avoids premature complexity while preserving a clear scaling path.
 
 ---
 
@@ -291,7 +301,7 @@ GIN indexes on `payload` or `breakdown` are **not** created initially. Rationale
 
 **Scenario:** Laravel sends `POST /submissions` with `submission_id = X`. The network drops before Laravel receives the `201` response. Laravel retries with the identical envelope (same UUID).
 
-**Proposed solution — INSERT-or-return pattern:**
+**Solution — `SELECT ... FOR UPDATE` insert-or-return pattern** (see ADR-DB-004):
 
 ```text
 1. BEGIN TRANSACTION
@@ -299,13 +309,13 @@ GIN indexes on `payload` or `breakdown` are **not** created initially. Rationale
 3. IF row exists:
      a. Load associated scoring_result
      b. COMMIT
-     c. Return existing ScoringResultResponse (with 200 OK, not 201)
+     c. Return existing ScoringResultResponse (200 OK — duplicate)
 4. ELSE:
      a. Run Stage 1 → Stage 2 → Governance pipeline
-     b. INSERT INTO submissions (...)
+     b. INSERT INTO submissions (..., status='pending_review')
      c. INSERT INTO scoring_results (...)
      d. COMMIT
-     e. Return new ScoringResultResponse (with 201 Created)
+     e. Return new ScoringResultResponse (201 Created)
 ```
 
 **Key design decisions:**
@@ -317,15 +327,11 @@ GIN indexes on `payload` or `breakdown` are **not** created initially. Rationale
 | Return `200` for duplicate, `201` for new | The client can distinguish "already processed" from "newly created" without error handling. Both responses carry the same `ScoringResultResponse` body. |
 | No TTL / expiry on idempotency | Since submissions are immutable and stored indefinitely, the idempotency guarantee is permanent. No cleanup job needed. |
 
-**Edge case — same UUID, different payload:**
-
-If the client sends the same `submission_id` with a different payload (a bug, not a retry), Winnow returns the original result and logs a `WARNING`. The payload is **not** compared — the UUID alone determines identity. Comparing payloads would be expensive (JSONB deep-equality) and unnecessary if the client correctly treats `submission_id` as a unique submission identifier.
+**Edge case — same UUID, different payload:** If the client sends the same `submission_id` with a different payload (a bug, not a retry), Winnow returns the original result and logs a `WARNING`. The UUID alone determines identity.
 
 ### 2.3 Edits & The Append-Only / Immutable Pattern
 
-**Scenario:** A citizen scientist submits a tree measurement. Later, they correct the height from 18.5m to 22.0m in the Laravel UI. Laravel generates a new `submission_id` and sends a new `POST /submissions` to Winnow.
-
-**How it works:**
+**Scenario:** A citizen scientist submits a tree measurement. Later, they correct the height in the Laravel UI. Laravel generates a new `submission_id` and sends a new `POST /submissions`.
 
 ```mermaid
 sequenceDiagram
@@ -335,50 +341,44 @@ sequenceDiagram
 
     Note over Laravel: Original submission
     Laravel->>Winnow: POST /submissions {submission_id: AAA, payload: {height: 18.5}}
-    Winnow->>DB: INSERT submission AAA (status: pending_finalization)
-    Winnow->>DB: INSERT scoring_result for AAA (score: 67.5)
-    Winnow-->>Laravel: 201 {submission_id: AAA, score: 67.5}
+    Winnow->>DB: INSERT submission AAA (status: pending_review)
+    Winnow->>DB: INSERT scoring_result for AAA
+    Winnow-->>Laravel: 201 {submission_id: AAA, status: pending_review}
 
     Note over Laravel: User edits height to 22.0
     Laravel->>Laravel: Generate new submission_id BBB
     Laravel->>Winnow: POST /submissions {submission_id: BBB, payload: {height: 22.0}}
-    Winnow->>DB: INSERT submission BBB (status: pending_finalization)
-    Winnow->>DB: INSERT scoring_result for BBB (score: 72.3)
-    Winnow-->>Laravel: 201 {submission_id: BBB, score: 72.3}
+    Winnow->>DB: INSERT submission BBB (status: pending_review)
+    Winnow->>DB: INSERT scoring_result for BBB
+    Winnow-->>Laravel: 201 {submission_id: BBB, status: pending_review}
 
-    Note over DB: Both AAA and BBB exist as independent records
+    Note over Laravel: Retire the old submission
+    Laravel->>Winnow: PATCH /submissions/AAA/supersede {status: "superseded", superseded_by: "BBB"}
+    Winnow->>DB: UPDATE submissions SET status='superseded', superseded_by=BBB WHERE id=AAA
+    Winnow-->>Laravel: 200 {submission_id: AAA, status: superseded, superseded_by: BBB}
 ```
 
-**What happens to the old submission (AAA)?**
+**`superseded` status — fully accepted design** (see ADR-DB-005):
 
-| Approach | Description | Chosen? |
-|---|---|---|
-| **Do nothing** | AAA remains `pending_finalization` forever. The Trust Advisor's per-user stats include it, potentially skewing metrics. | ❌ |
-| **Laravel finalizes AAA as `rejected`** | Laravel sends `PATCH /submissions/AAA/final-status {rejected}` before or after sending BBB. This closes AAA's lifecycle cleanly and the Trust Advisor processes it as a rejection. | ❌ Unfair — the user corrected their own data, this is not a quality failure. |
-| **Introduce a `superseded` status** | A new terminal status that means "replaced by a newer submission." The Trust Advisor ignores `superseded` submissions (they carry no trust signal). Laravel sends a dedicated request to mark AAA as `superseded`. | ✅ Recommended |
-
-**Proposed `superseded` mechanism:**
-
-1. **Extend the status enum** to include `superseded` as a terminal state alongside `approved` and `rejected`.
-2. **`superseded_by` field:** Stored on the `submissions` row — the `submission_id` of the replacement submission. Required in the `SupersedeRequest` body.
-3. **Trust Advisor behaviour:** Submissions with `status = 'superseded'` are excluded from approval-rate and streak calculations. They are neutral — neither reward nor penalty.
-4. **Task query behaviour:** `superseded` submissions are excluded from `GET /tasks/available` results.
-5. **Client responsibility:** Laravel is responsible for calling `PATCH /submissions/AAA/supersede {status: "superseded", superseded_by: "BBB"}` when a correction is made. Winnow does not auto-detect corrections (it has no knowledge of domain-level entity identity like `tree_id`).
+1. `superseded` is a terminal status with a dedicated `PATCH /submissions/{id}/supersede` endpoint. It is **not** reachable via the voting/finalization flow.
+2. `superseded_by` UUID column on `submissions` points to the replacement submission.
+3. Trust Advisor excludes `superseded` submissions from approval-rate and streak calculations.
+4. `GET /tasks/available` excludes `superseded` submissions from the review queue.
 
 **Updated status lifecycle:**
 
 ```mermaid
 stateDiagram-v2
-    [*] --> pending_review: POST /submissions
-    pending_review --> approved: POST /votes (vote threshold met)
-    pending_review --> rejected: POST /votes (vote threshold met)
+    [*] --> pending_review: POST /submissions (scored)
+    pending_review --> approved: POST /votes (approve weight ≥ threshold_score)
+    pending_review --> rejected: POST /votes (reject weight ≥ threshold_score)
     pending_review --> superseded: PATCH /supersede (client correction)
     approved --> [*]
     rejected --> [*]
     superseded --> [*]
 
-    note right of approved: Auto-finalised by Governance Engine\nwhen accumulated role-weight ≥ threshold_score.
-    note right of superseded: Replaced by a newer submission.\nTrust Advisor ignores this record.
+    note right of approved: Auto-finalized by Governance Engine.\naccumulated role_weights sum ≥ threshold_score.
+    note right of superseded: Replaced by a newer submission.\nsuperseded_by FK set. Trust Advisor ignores this record.
 ```
 
 ### 2.4 Concurrent Database Writes — Race Conditions
@@ -391,60 +391,50 @@ Covered by §2.2 (`SELECT ... FOR UPDATE` pattern). The row-level pessimistic lo
 
 **Scenario:** Two reviewers simultaneously send `POST /submissions/{id}/votes` — both approvals that would each independently trigger the threshold.
 
-**Proposed solution — optimistic locking with status guard:**
+**Solution — `FOR UPDATE` status guard:**
 
 ```text
 1. BEGIN TRANSACTION
 2. SELECT status FROM submissions WHERE id = :id FOR UPDATE
-3. IF status != 'pending_finalization':
+3. IF status != 'pending_review':
      a. COMMIT
-     b. Return 409 Conflict (already-finalized)
+     b. Return 409 Conflict (already-finalized) — or 200 OK if same status (idempotent)
 4. ELSE:
-     a. UPDATE submissions SET status = :final_status, updated_at = now()
-     b. Compute Trust Advisor adjustment
-     c. UPDATE scoring_results SET trust_adjustment = ..., finalized_at = now(), reviewed_by = ..., review_note = ...
+     a. INSERT INTO submission_votes (...)
+     b. Evaluate accumulated weights vs threshold_score
+     c. IF threshold met:
+          - UPDATE submissions SET status = :final_status, updated_at = now()
+          - UPDATE scoring_results SET trust_adjustment = ..., finalized_at = now()
+          - INSERT INTO webhook_outbox (...) -- same transaction, Outbox pattern
      d. COMMIT
-     e. Return 200 OK
+     e. Return VoteResponse
 ```
 
-The `FOR UPDATE` lock on the submission row serialises concurrent finalization attempts. The first transaction to acquire the lock wins; the second sees `status != 'pending_finalization'` and receives a `409 Conflict`.
-
-**Idempotent finalization:** If the same `final_status` is sent twice (a retry), the second attempt also hits the `409` path. However, per `03_api_contracts.md` §8.5, finalization should be idempotent. The refined logic:
-
-```text
-3. IF status == :final_status (same status re-sent):
-     → Return existing FinalizationResponse (200 OK, idempotent)
-   ELIF status != 'pending_finalization' (different status):
-     → Return 409 Conflict (already finalized with a different status)
-```
+The `FOR UPDATE` lock serialises concurrent finalization. The first transaction wins; the second sees `status != 'pending_review'` and returns `409 Conflict`.
 
 #### 2.4.3 Submission Received During Finalization
 
-**Scenario:** A new `POST /submissions` arrives while a vote-threshold auto-finalization is being processed for a different submission by the same user. The Trust Advisor's `user_history` query could see inconsistent data.
-
-**Risk assessment:** 🟢 Low. The Trust Advisor queries aggregate stats (approval count, streak length). A single in-flight finalization causing a slightly stale count is an acceptable trade-off — the delta will be ±1 at most, and the next finalization will correct it. No special locking is needed.
+**Risk assessment:** 🟢 Low. The Trust Advisor queries aggregate stats over a user's history. A single in-flight finalization causing a ±1 stale count is an acceptable prototype trade-off. No special cross-submission locking is needed.
 
 #### 2.4.4 Orphaned Scoring Results
 
-**Scenario:** The application crashes between `INSERT INTO submissions` and `INSERT INTO scoring_results`.
+**Scenario:** Application crash between `INSERT INTO submissions` and `INSERT INTO scoring_results`.
 
-**Solution:** Both inserts occur within a single database transaction. If the transaction is interrupted, both are rolled back. The client retries and the idempotency logic (§2.2) finds no existing row, proceeding with a clean insert of both records.
+**Solution:** Both inserts occur within a single database transaction. A crash rolls back both. The client retries; the idempotency logic finds no existing row and proceeds cleanly.
 
 ### 2.5 JSONB Data Integrity
 
-**Scenario:** A future code change or migration corrupts the `breakdown` JSONB, making it unparseable by the `ScoringResultResponse` Pydantic schema.
-
-**Mitigations:**
+**Scenario:** A code change or migration corrupts the `breakdown` JSONB, making it unparseable by `ScoringResultResponse`.
 
 | Strategy | Detail |
 |---|---|
-| **Application-level validation** | Data is always written through Pydantic models (`RuleBreakdown`, `RequiredValidations`, `ThresholdConfig`) which enforce structural correctness before persistence. Raw JSONB is never written by hand. |
-| **Read-time validation** | When loading scoring results for API responses, the service layer deserialises JSONB through the same Pydantic models. Corrupt data triggers a `ValidationError` that is caught and logged rather than silently served. |
-| **Schema versioning (future)** | If the `RuleBreakdown` shape changes, a `schema_version` integer column on `scoring_results` can be added. The read path selects the correct deserialiser based on version. For Phase 1, the schema is stable enough that this is unnecessary. |
+| **Application-level validation** | Data is always written through Pydantic models (`RuleBreakdown`, `RequiredValidations`, `ThresholdConfig`) which enforce structural correctness before persistence. |
+| **Read-time validation** | When loading scoring results for API responses, the service layer deserialises JSONB through the same Pydantic models. Corrupt data triggers a `ValidationError` that is caught and logged. |
+| **Schema versioning (future)** | A `schema_version` integer column on `scoring_results` can be added if the `RuleBreakdown` shape ever changes. For Phase 1, the schema is stable. |
 
 ### 2.6 Trust Advisor — User History Aggregation
 
-**Scenario:** The Trust Advisor needs per-user submission stats (approval rate, consecutive approval streak, total finalized count). These are derived from the `submissions` table, not a separate users table (Rule 5: no user tables in Winnow).
+**Scenario:** The Trust Advisor needs per-user submission stats (approval rate, consecutive approval streak, total finalized count) derived from the `submissions` table. No separate users table (Rule 5).
 
 **Query strategy:**
 
@@ -457,48 +447,37 @@ SELECT
 FROM submissions
 WHERE user_id = :user_id
   AND project_id = :project_id
-  AND status IN ('approved', 'rejected');  -- excludes 'superseded' and 'pending_finalization'
+  AND status IN ('approved', 'rejected');  -- excludes 'superseded' and 'pending_review'
 ```
 
 **Streak calculation:** The consecutive approval streak requires ordering by `submitted_at` and scanning backwards until the first non-`approved` status. This is computed in Python after fetching the user's recent finalized submissions (ordered by `submitted_at DESC`, limited to a configurable window).
 
-**Performance note:** The composite index `(user_id, project_id, status)` would accelerate these queries. However, for the prototype (low cardinality), the existing `ix_submissions_user_id` index is sufficient. A composite index can be added if profiling reveals a bottleneck.
+**Performance note:** The composite index `(user_id, project_id, status)` would accelerate these queries. For the prototype (low cardinality), the existing `ix_submissions_user_id` index is sufficient. A composite index can be added if profiling reveals a bottleneck.
 
-### 2.7 Stale `pending_finalization` Submissions
+### 2.7 Stale `pending_review` Submissions
 
-**Scenario:** Submissions that never receive a finalization signal accumulate over time (see Risk R9 in `04_risk_analysis.md`).
+**Scenario:** Submissions that never receive enough votes accumulate over time.
 
-**Database-level support:**
-
-1. **No auto-expiry in Phase 1.** The application does not auto-finalize stale submissions. This keeps the prototype simple and avoids opinionated TTL defaults.
-2. **Monitoring query:** A simple `SELECT COUNT(*), MIN(created_at) FROM submissions WHERE status = 'pending_finalization' AND created_at < now() - interval '7 days'` can be exposed via the health endpoint or a dedicated admin endpoint.
-3. **Phase 2 extension:** An optional `expired` terminal status and a background task that transitions stale submissions after a configurable TTL (per-project, from `project_configs`).
+1. **No auto-expiry in Phase 1.** The application does not auto-finalize stale submissions.
+2. **Monitoring query:** `SELECT COUNT(*), MIN(created_at) FROM submissions WHERE status = 'pending_review' AND created_at < now() - interval '7 days'` can be exposed via the health or admin endpoint.
+3. **Phase 2 extension:** An optional `expired` terminal status and a background task that transitions stale submissions after a configurable TTL sourced from `project_configs`.
 
 ### 2.8 Clock Skew Between Client and Server
 
-**Scenario:** The `submitted_at` timestamp in the envelope is generated by the Laravel server. The `created_at` timestamp in Winnow's DB is generated by PostgreSQL. If the clocks are skewed, `submitted_at > created_at` is possible.
+**Scenario:** `submitted_at` is generated by the Laravel server; `created_at` is generated by PostgreSQL. Clock skew can make `submitted_at > created_at`.
 
-**Impact:** Minor — both timestamps are stored independently. `submitted_at` is the client's assertion of when the data was collected; `created_at` is when Winnow received it. Queries that need ordering should use `created_at` (server-authoritative) for consistency.
-
-**Mitigation:** Document the convention: `submitted_at` = client time, `created_at` = server time. No clock synchronisation is enforced.
+**Convention:** `submitted_at` = client assertion of when data was collected. `created_at` = server-authoritative receipt time. Ordering queries must use `created_at`. No clock synchronisation enforced.
 
 ### 2.9 Large JSONB Payloads
 
-**Scenario:** A client sends an unusually large payload (e.g., hundreds of photos with long notes).
-
 **Mitigations:**
-
-1. **Pydantic Stage 1 validation** already enforces structural constraints (e.g., `photos: list[TreePhotoPayload]` with bounded fields). This implicitly limits payload size per project.
-2. **Web server body size limit.** Configure a maximum request body size (e.g., 1 MB) at the Caddy reverse proxy or FastAPI level.
-3. **PostgreSQL TOAST.** JSONB values exceeding ~2 KB are automatically compressed and stored out-of-line by PostgreSQL's TOAST mechanism. No special handling needed.
+1. **Pydantic Stage 1 validation** enforces structural constraints (bounded field lists) before persistence.
+2. **Web server body size limit.** Configured at the Caddy reverse proxy (or FastAPI middleware). Recommended: 1 MB max.
+3. **PostgreSQL TOAST.** JSONB values exceeding ~2 KB are compressed and stored out-of-line automatically.
 
 ### 2.10 Concurrent Bootstrap in Multi-Worker Deployments
 
-**Scenario:** When running multiple Uvicorn workers (e.g., `--workers 4`), each worker calls `bootstrap()` independently. The in-memory registry is per-process — this is correct and intentional (no shared state between workers).
-
-**Risk:** None for the code-based registry (Phase 1). Each worker builds identical `ProjectRegistryEntry` objects from the same `ProjectBuilder` classes.
-
-**Phase 2 risk (DB-backed registry):** If `bootstrap()` reads config from the database, all workers see the same data (PostgreSQL handles concurrent reads). Config updates would require a worker restart or a cache-invalidation mechanism (e.g., polling interval).
+**Scenario:** Multiple Uvicorn workers each call `bootstrap()` independently. The in-memory registry is per-process — intentional. Each worker builds identical `ProjectRegistryEntry` objects from the same `ProjectBuilder` classes. No shared state required for Phase 1. See §2.1 for the Phase 2 DB-backed registry concern.
 
 ---
 
@@ -509,71 +488,72 @@ WHERE user_id = :user_id
 | Field | Value |
 |---|---|
 | **Status** | Accepted |
-| **Context** | Submissions arrive with a client-generated `submission_id` (UUID). We need to choose between using this as the PK or generating a server-side surrogate key. |
-| **Decision** | Use the client-generated `submission_id` as the primary key of the `submissions` table. |
-| **Rationale** | (1) Natural idempotency — `INSERT ... ON CONFLICT (id) DO NOTHING` or `SELECT ... FOR UPDATE` eliminates the need for a separate idempotency-key table. (2) Consistent with the Laravel client, which uses UUIDs for all entity IDs. (3) Avoids a secondary unique index on `submission_id` (which would be needed if we used a surrogate PK). |
-| **Consequences** | Winnow trusts the client to generate unique UUIDs. A UUID collision (astronomically unlikely with UUIDv4) would be treated as a duplicate submission, not an error. The client must generate a new UUID for each genuinely new submission. |
+| **Context** | Submissions arrive with a client-generated `submission_id` (UUID). |
+| **Decision** | Use the client-generated `submission_id` as the PK of `submissions`. |
+| **Rationale** | (1) Natural idempotency — `SELECT ... FOR UPDATE` eliminates a separate idempotency-key table. (2) Consistent with Laravel's UUID-first convention. (3) Avoids a secondary unique index. |
+| **Consequences** | Winnow trusts the client to generate unique UUIDs. A UUIDv4 collision is astronomically unlikely and would be treated as a duplicate submission, not an error. |
 
 ### ADR-DB-002: JSONB for Dynamic Payloads and Score Breakdowns
 
 | Field | Value |
 |---|---|
 | **Status** | Accepted |
-| **Context** | Submission payloads vary per project. Score breakdowns vary per project (different rules, different counts). We need a storage strategy that accommodates this variability. |
+| **Context** | Submission payloads and score breakdowns vary per project. |
 | **Decision** | Store `payload`, `breakdown`, `required_validations`, `thresholds`, and `trust_adjustment` as `JSONB` columns. |
-| **Rationale** | (1) Avoids per-project table proliferation — adding a new project requires zero schema migrations. (2) JSONB supports efficient containment queries and GIN indexing if needed later. (3) These fields are always read/written as a unit — no partial-column queries in the operational path. (4) PostgreSQL TOAST handles large values transparently. |
-| **Trade-offs** | (1) No DB-level enforcement of JSONB internal structure (mitigated by Pydantic validation at the application level). (2) Cross-submission analytics on individual rule scores require JSONB path expressions or materialised views (acceptable for Phase 1). |
-| **Alternatives Rejected** | (1) Normalised `rule_scores` child table — adds N rows per submission with no operational benefit. (2) EAV (Entity-Attribute-Value) pattern — poor query performance and no type safety. (3) Per-project tables — dynamic DDL is fragile and incompatible with SQLAlchemy's declarative model. |
+| **Rationale** | (1) No per-project table proliferation — adding a project requires zero schema migrations. (2) JSONB supports GIN indexing if needed later. (3) These fields are always read/written as a unit. (4) TOAST handles large values transparently. |
+| **Trade-offs** | No DB-level structural enforcement inside JSONB (mitigated by Pydantic). Cross-submission analytics on rule scores require JSONB path expressions or materialised views. |
+| **Rejected alternatives** | Normalised `rule_scores` child table (N rows per submission, no operational benefit); EAV pattern (poor performance, no type safety); per-project tables (dynamic DDL incompatible with declarative ORM). |
 
 ### ADR-DB-003: Separate `scoring_results` Table (1:1 with `submissions`)
 
 | Field | Value |
 |---|---|
 | **Status** | Accepted |
-| **Context** | Scoring results could be stored as additional columns on the `submissions` table or in a separate table. |
-| **Decision** | Use a separate `scoring_results` table with a `UNIQUE` foreign key to `submissions`. |
-| **Rationale** | (1) Separation of input (envelope snapshot) from output (computed score). (2) Different write patterns — submissions are write-once; scoring results are written then updated on finalization. (3) Cleaner ORM mapping — the `Submission` model stays focused on the envelope; the `ScoringResult` model owns all computed fields. (4) Future extensibility — relaxing the `UNIQUE` constraint enables re-scoring without schema migration. |
-| **Consequences** | Queries that need both submission metadata and scoring data require a JOIN. This is a single-row JOIN on an indexed FK — negligible cost. |
+| **Context** | Scoring results could be extra columns on `submissions` or in a separate table. |
+| **Decision** | Separate `scoring_results` table with a `UNIQUE` FK to `submissions`. |
+| **Rationale** | (1) Different write patterns — submissions are write-once (plus status updates); scoring results are written then updated on finalization. (2) Dashboard queries can target `scoring_results` without loading the heavy `payload` JSONB. (3) Future re-scoring just relaxes the `UNIQUE` constraint. |
+| **Consequences** | Queries needing both submission metadata and scores require a JOIN. This is a single-row JOIN on an indexed FK — negligible cost. |
 
-### ADR-DB-004: Optimistic Idempotency via `SELECT ... FOR UPDATE`
+### ADR-DB-004: `SELECT ... FOR UPDATE` for Idempotency and Finalization Locking
 
 | Field | Value |
 |---|---|
 | **Status** | Accepted |
-| **Context** | Network retries can cause duplicate `POST /submissions` requests with the same `submission_id`. |
-| **Decision** | Use `SELECT ... FOR UPDATE` to check for an existing submission before inserting. Return the existing result for duplicates. |
-| **Rationale** | (1) The client-generated UUID is the natural idempotency key (see ADR-DB-001). (2) `FOR UPDATE` serialises concurrent attempts without deadlocks (single-row lock). (3) No separate idempotency-key table or cache needed. (4) The idempotency guarantee is permanent (submissions are never deleted). |
-| **Alternatives Rejected** | (1) `INSERT ... ON CONFLICT DO NOTHING` + re-SELECT — viable but loses the ability to distinguish "new" from "duplicate" in a single transaction without an additional query. (2) Redis-based idempotency cache with TTL — adds infrastructure complexity and a temporal expiry that contradicts the immutable-snapshots philosophy. |
+| **Context** | Two patterns were considered for network-retry idempotency and concurrent finalization prevention. |
+| **Decision** | Use `SELECT ... FOR UPDATE` in both the submission insert path (§2.2) and the vote/finalization path (§2.4.2). |
+| **Rationale** | (1) The client-generated UUID is the natural idempotency key — no separate table or cache needed. (2) `FOR UPDATE` serialises concurrent attempts without deadlocks (single-row lock). (3) Enables distinguishing `200 OK` (duplicate) from `201 Created` (new) in one transaction. (4) Idempotency is permanent — no TTL or cleanup job needed. |
+| **Rejected alternative — `INSERT ... ON CONFLICT DO NOTHING` + re-SELECT** | Viable for the submission insert, but loses the ability to distinguish new vs duplicate in one round-trip. Rejected for consistency: the finalization path always needs `FOR UPDATE` anyway, so using the same pattern in both places reduces cognitive load. |
+| **Rejected alternative — Redis idempotency cache** | Adds infrastructure complexity and a temporal expiry (TTL) that contradicts the immutable-snapshots principle. |
 
 ### ADR-DB-005: `superseded` Status for Edited Submissions
 
 | Field | Value |
 |---|---|
-| **Status** | Proposed |
-| **Context** | When a user corrects data in the client, a new submission is sent to Winnow. The old submission remains in `pending_finalization`, which pollutes Trust Advisor metrics and the review queue. |
-| **Decision** | Introduce `superseded` as a terminal submission status. The client calls `PATCH /final-status` with `{status: "superseded", superseded_by: "<new_id>"}` to cleanly close the old submission's lifecycle. |
-| **Rationale** | (1) Preserves audit integrity — the old submission and its score remain readable. (2) Does not penalise the user — `superseded` carries no trust signal (excluded from approval rate and streak calculations). (3) Keeps the review queue clean — `superseded` submissions are excluded from task queries. (4) Explicit client action required — Winnow does not auto-detect corrections, respecting domain ownership boundaries. |
-| **Consequences** | (1) The status `CHECK` constraint must include `superseded`. (2) The `FinalizationRequest` schema gains an optional `superseded_by: UUID | None` field. (3) The `submissions` table gains an optional `superseded_by: UUID | None` FK column (self-referential). (4) Trust Advisor queries must filter `WHERE status IN ('approved', 'rejected')`. |
+| **Status** | Accepted — implemented in Sprint 2.6 |
+| **Context** | When a user corrects domain data in the client, a new submission is sent to Winnow. The old submission must be cleanly retired without penalising the user. |
+| **Decision** | `superseded` is a terminal status reachable only via `PATCH /submissions/{id}/supersede`. The `submissions` table carries a nullable `superseded_by UUID` self-referential FK pointing to the replacement. |
+| **Rationale** | (1) Preserves audit integrity — the old submission and its score remain readable. (2) Does not penalise the user — `superseded` is excluded from Trust Advisor metrics. (3) Keeps the review queue clean — excluded from `GET /tasks/available`. (4) Explicit client action required — Winnow does not auto-detect corrections, respecting domain ownership boundaries (Rule 5). (5) Dedicated endpoint (`PATCH /supersede`) enforces a `Literal["superseded"]` request body, preventing accidental mis-use to approve/reject. |
+| **Schema consequences** | (1) `CHECK` constraint includes `superseded`. (2) `submissions.superseded_by` is a nullable UUID FK (self-referential). (3) Trust Advisor queries filter `WHERE status IN ('approved', 'rejected')`. (4) Task queries filter `WHERE status = 'pending_review'`. |
 
 ### ADR-DB-006: Pessimistic Locking for Finalization (Prevent Double-Finalize)
 
 | Field | Value |
 |---|---|
 | **Status** | Accepted |
-| **Context** | Two concurrent `PATCH /final-status` requests for the same submission could both read `status = 'pending_finalization'` and proceed, creating a race condition where the Trust Advisor runs twice with inconsistent inputs. |
-| **Decision** | Use `SELECT ... FOR UPDATE` on the submission row before checking and updating its status. |
-| **Rationale** | (1) Serialises concurrent finalization attempts at the row level. (2) The first transaction wins; the second sees the updated status and returns `409 Conflict` (or `200 OK` if idempotent same-status retry). (3) Lock scope is a single row — no table-level contention. |
-| **Consequences** | Finalization requests for the *same* submission are serialised (acceptable — this is rare). Finalization requests for *different* submissions proceed in parallel (row-level locks do not interfere). |
+| **Context** | Two concurrent `POST /votes` requests could both read `status = 'pending_review'` and both trigger the threshold. |
+| **Decision** | Use `SELECT ... FOR UPDATE` on the submission row before checking and updating status in the vote-registration transaction. |
+| **Rationale** | (1) Serialises concurrent finalization attempts at the row level. (2) First transaction wins; second sees updated status and returns `409 Conflict`. (3) Lock scope is a single row — no table-level contention. Requests for *different* submissions proceed in parallel. |
+| **Consequences** | The outbox INSERT (webhook creation) is part of the same transaction as the status UPDATE, preserving the atomicity guarantee of the Transactional Outbox pattern. |
 
 ### ADR-DB-007: Single Global `submissions` Table with Future Partitioning Path
 
 | Field | Value |
 |---|---|
 | **Status** | Accepted |
-| **Context** | Multiple projects will share the Winnow instance. Should submissions be stored in a single table or per-project tables? |
+| **Context** | Multiple projects will share the Winnow instance. Per-project tables were considered. |
 | **Decision** | Single global `submissions` table with `project_id` as a discriminator column. |
-| **Rationale** | (1) Simplest ORM mapping — one `Submission` model, one Alembic migration. (2) Cross-project queries (admin dashboards, health monitoring) are trivial. (3) PostgreSQL declarative partitioning by `project_id` can be introduced transparently if needed — the application code sees a single logical table. (4) For the thesis prototype with a single project, per-project tables would add complexity with zero benefit. |
-| **Scaling Path** | When Winnow serves multiple high-volume projects, introduce `PARTITION BY LIST (project_id)` via Alembic migration. Each partition is independently vacuumed and can be stored on different tablespaces. The application layer requires no changes. |
+| **Rationale** | (1) One ORM model, one Alembic migration. (2) Cross-project admin queries are trivial. (3) PostgreSQL declarative partitioning by `project_id` can be added transparently via migration if volume demands it — the application layer requires zero changes. (4) For the thesis prototype with a single project, per-project tables add complexity with no benefit. |
+| **Scaling path** | When Winnow serves multiple high-volume projects: `ALTER TABLE submissions PARTITION BY LIST (project_id)`. Each partition vacuums independently. Application code unchanged. |
 
 ---
 
@@ -582,75 +562,123 @@ WHERE user_id = :user_id
 ### 4.1 Alembic Configuration
 
 - **Async driver:** Use `asyncpg` via SQLAlchemy's `create_async_engine`. Alembic's `env.py` will use `run_async()` to execute migrations.
-- **Autogenerate:** Enable Alembic autogenerate against the `Base.metadata` from `app/models/base.py`.
-- **Naming convention:** Use SQLAlchemy's `MetaData(naming_convention=...)` to produce deterministic, human-readable constraint names (e.g., `pk_submissions`, `fk_scoring_results_submission_id`, `ix_submissions_project_id`).
+- **Autogenerate:** Enable Alembic autogenerate against `Base.metadata` from `app/models/base.py`.
+- **Naming convention:** Use SQLAlchemy's `MetaData(naming_convention=...)` to produce deterministic, human-readable constraint names (e.g., `pk_submissions`, `fk_scoring_results_submission_id`, `uq_submission_votes_submission_id_user_id`).
 
-### 4.2 Initial Migration (Sprint 3)
+### 4.2 Initial Migration — Sprint 3 (All Four Tables)
 
-The first migration creates:
-1. `submissions` table with all columns and indexes.
-2. `scoring_results` table with FK, unique constraint, and indexes.
-3. Status `CHECK` constraint: `status IN ('pending_finalization', 'approved', 'rejected', 'superseded')`.
-4. `confidence_score` `CHECK` constraint: `0 <= confidence_score <= 100`.
+The first Alembic migration creates all four Sprint 3 tables in dependency order:
+
+**Step 1 — `submissions`:**
+- All columns including `superseded_by UUID NULL`.
+- `CHECK` constraint: `status IN ('pending_review', 'approved', 'rejected', 'superseded')`.
+- Self-referential FK: `superseded_by → submissions.id` (deferred or nullable — no circular dependency issue since it's self-referential on nullable column).
+- Indexes: `ix_submissions_project_id`, `ix_submissions_user_id`, `ix_submissions_status_project` (composite on `project_id, status`).
+
+**Step 2 — `scoring_results`:**
+- FK: `submission_id → submissions.id`.
+- `UNIQUE` constraint on `submission_id` (enforces 1:1).
+- `CHECK` constraint: `0 <= confidence_score <= 100`.
+- Index: `ix_scoring_results_confidence_score`.
+
+**Step 3 — `submission_votes`:**
+- FK: `submission_id → submissions.id`.
+- `UNIQUE` constraint: `(submission_id, user_id)`.
+- `CHECK` constraint: `vote IN ('approve', 'reject')`.
+
+**Step 4 — `webhook_outbox`:**
+- FK: `submission_id → submissions.id`.
+- `CHECK` constraint: `status IN ('pending', 'in_progress', 'delivered', 'failed', 'dead_letter')`.
+- Composite index: `ix_webhook_outbox_status_next_retry` on `(status, next_retry_at)`.
 
 The `project_configs` table is **not** created in Sprint 3 (Phase 2 scope).
 
 ### 4.3 Rollback Safety
 
-Every migration must include a `downgrade()` function that cleanly reverses the schema change. For the initial migration, `downgrade()` drops both tables (safe because there is no production data yet).
+Every migration includes a `downgrade()` function. For the initial migration, `downgrade()` drops all four tables in reverse dependency order: `webhook_outbox` → `submission_votes` → `scoring_results` → `submissions`. Safe because there is no production data yet.
 
 ---
 
 ## 5. SQLAlchemy Model Design Notes
 
-### 5.1 Base Model Mixin
+### 5.1 Base Model Mixins
 
-A `TimestampMixin` in `app/models/base.py` provides `created_at` and `updated_at` columns to all models, using `server_default=func.now()` and `onupdate=func.now()`.
+A `TimestampMixin` in `app/models/base.py` provides `created_at` and `updated_at` to all models using `server_default=func.now()` and `onupdate=func.now()`.
 
-A `UUIDPrimaryKeyMixin` provides `id: Mapped[uuid.UUID]` with `server_default=func.gen_random_uuid()` for server-generated keys (used by `scoring_results`).
+A `UUIDPrimaryKeyMixin` provides `id: Mapped[uuid.UUID]` with `server_default=text("gen_random_uuid()")` for server-generated keys (used by `scoring_results`, `submission_votes`, `webhook_outbox`).
 
 The `submissions` table does **not** use the UUID mixin because its PK is client-generated (no server default).
 
-### 5.2 Status as a Python Enum
-
-Define a `SubmissionStatus` Python `enum.StrEnum`:
+### 5.2 Status as a Python StrEnum
 
 ```text
 class SubmissionStatus(StrEnum):
-    PENDING_FINALIZATION = "pending_finalization"
-    APPROVED = "approved"
-    REJECTED = "rejected"
-    SUPERSEDED = "superseded"
+    PENDING_REVIEW    = "pending_review"       # initial state (Governance Engine flow)
+    APPROVED          = "approved"             # terminal — vote threshold met (approve)
+    REJECTED          = "rejected"             # terminal — vote threshold met (reject)
+    SUPERSEDED        = "superseded"           # terminal — replaced by corrected submission
 ```
 
-Map this to a `VARCHAR` column (not a PostgreSQL `ENUM` type). Rationale: PostgreSQL native enums require an `ALTER TYPE ... ADD VALUE` migration to extend, which cannot run inside a transaction. VARCHAR with a CHECK constraint is easier to migrate.
+Mapped to a `VARCHAR` column (not a PostgreSQL `ENUM` type). Rationale: PostgreSQL native enums require an `ALTER TYPE ... ADD VALUE` migration that cannot run inside a transaction. `VARCHAR` + `CHECK` constraint is easier to extend safely.
 
 ### 5.3 Relationship Mapping
 
 ```text
-Submission.scoring_result  →  relationship("ScoringResult", back_populates="submission", uselist=False)
-ScoringResult.submission   →  relationship("Submission", back_populates="scoring_result")
+Submission.scoring_result  → relationship("ScoringResult", back_populates="submission", uselist=False)
+ScoringResult.submission   → relationship("Submission", back_populates="scoring_result")
+
+Submission.votes           → relationship("SubmissionVote", back_populates="submission")
+SubmissionVote.submission  → relationship("Submission", back_populates="votes")
+
+Submission.outbox_events   → relationship("WebhookOutbox", back_populates="submission")
+WebhookOutbox.submission   → relationship("Submission", back_populates="outbox_events")
 ```
 
-`uselist=False` enforces the 1:1 cardinality at the ORM level, complementing the `UNIQUE` constraint at the database level.
+`uselist=False` on `Submission.scoring_result` enforces the 1:1 cardinality at the ORM level.
+
+### 5.4 JSONB Column Typing
+
+JSONB columns are typed as `Mapped[dict]` with `type_=JSONB` (from `sqlalchemy.dialects.postgresql`). Pydantic model serialisation/deserialisation (`.model_dump()` / `model_validate()`) is the application's responsibility at the service layer — the ORM stores and retrieves raw Python dicts.
 
 ---
 
-## 6. Summary — What This Document Enables
+## 6. Sprint 3 — Step-by-Step Implementation Plan
 
-This document provides the complete blueprint for Sprint 3 implementation:
+The following sequence defines the order in which Sprint 3 code will be written. Each step is independently testable.
+
+| Step | Artefact | Description |
+|---|---|---|
+| **1** | `app/models/base.py` | `TimestampMixin`, `UUIDPrimaryKeyMixin`, `Base = DeclarativeBase()`, `MetaData` with naming convention. |
+| **2** | `app/models/submission.py` | `Submission` ORM model. All columns from §1.2. `SubmissionStatus` StrEnum. Self-referential `superseded_by` FK. |
+| **3** | `app/models/scoring_result.py` | `ScoringResult` ORM model. 1:1 FK to `submissions`. JSONB columns. `relationship` back-ref. |
+| **4** | `app/models/submission_vote.py` | `SubmissionVote` ORM model. Composite unique constraint. |
+| **5** | `app/models/webhook_outbox.py` | `WebhookOutbox` ORM model. `OutboxStatus` StrEnum. Composite index. |
+| **6** | `app/db/session.py` | `create_async_engine`, `async_sessionmaker`, `get_db()` FastAPI dependency. `DATABASE_URL` from `app/core/config.py`. |
+| **7** | Alembic initial migration | `alembic revision --autogenerate -m "initial_schema"`. Review generated script; add CHECK constraints manually (autogenerate does not emit `CheckConstraint`). |
+| **8** | `app/services/submission_service.py` | Replace in-memory stub with DB `INSERT` (idempotency via `SELECT ... FOR UPDATE`). Atomic `submissions` + `scoring_results` insert in one transaction. |
+| **9** | `app/services/voting_service.py` | Replace in-memory `_submissions` dict with DB reads/writes. Vote INSERT + threshold evaluation + conditional status UPDATE + outbox INSERT — all in one transaction (§2.4.2). |
+| **10** | `app/services/supersede_service.py` | Replace in-memory supersede stub with DB `UPDATE submissions SET status='superseded', superseded_by=...`. |
+| **11** | `app/services/webhook_service.py` | Implement outbox poller: `SELECT ... WHERE status IN ('pending','failed') AND next_retry_at <= now() FOR UPDATE SKIP LOCKED`. HTTP delivery + status update. |
+| **12** | Integration tests | Replace `TestClient` in-memory tests with `pytest-asyncio` + `asyncpg` against a test DB. Cover idempotency, duplicate-vote rejection, concurrent finalization, and supersede flow. |
+| **13** | Collision guard (`app/registry/manager.py`) | Add `allow_overwrite: bool = False` to `Registry.register()`. Bootstrap calls with `allow_overwrite=False` — raises `ValueError` on duplicate `project_id`. Test fixtures call with `allow_overwrite=True` for idempotent re-registration. Backed by `UNIQUE(project_id)` in `project_configs` (§2.1). |
+
+---
+
+## 7. Summary — What This Document Enables
 
 | Artefact | Section |
 |---|---|
 | Table definitions (columns, types, constraints) | §1.2 |
 | Index strategy | §1.4 |
 | ER diagram | §1.3 |
-| Idempotency implementation | §2.2 |
-| Edit/correction handling (`superseded` status) | §2.3 |
+| Status lifecycle (including `superseded`) | §1.2, §2.3 |
+| Idempotency implementation (`SELECT ... FOR UPDATE`) | §2.2, ADR-DB-004 |
+| Edit/correction handling (`superseded_by` FK) | §2.3, ADR-DB-005 |
 | Race condition mitigations | §2.4 |
 | Trust Advisor query patterns | §2.6 |
-| Alembic migration plan | §4 |
+| Alembic migration plan (4 tables) | §4.2 |
 | SQLAlchemy model design notes | §5 |
-| Formal ADRs for all decisions | §3 |
+| Formal ADRs for all decisions (all Accepted) | §3 |
+| Sprint 3 step-by-step implementation plan | §6 |
 
-**Next step:** Implement `app/models/base.py`, `app/models/submission.py`, `app/models/scoring_result.py`, `app/db/session.py`, and the initial Alembic migration — following the schema and decisions documented here.
+**All architectural decisions are now in `Accepted` status. No open trade-offs remain. Sprint 3 implementation may begin.**

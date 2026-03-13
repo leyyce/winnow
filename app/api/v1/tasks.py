@@ -11,8 +11,10 @@ References
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.deps import get_db
 from app.core.config import settings
 from app.schemas.tasks import TaskListResponse
 from app.services import governance_service
@@ -56,12 +58,14 @@ async def get_available_tasks(
         le=settings.TASK_PAGE_SIZE_MAX,
         description="Maximum number of tasks per page.",
     ),
+    db: AsyncSession = Depends(get_db),
 ) -> TaskListResponse:
     """Return available review tasks for the given reviewer."""
     return await governance_service.get_available_tasks(
         project_id=project_id,
         user_trust=user_trust,
         user_role=user_role,
+        db=db,
         page=page,
         per_page=per_page,
     )

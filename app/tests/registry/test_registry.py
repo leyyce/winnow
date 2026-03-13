@@ -184,14 +184,27 @@ class TestRegistry:
         assert "custom-id" in self.reg.registered_projects
         assert self.reg.get_config("custom-id") is entry
 
-    def test_load_overwrites_existing_entry(self):
+    def test_load_overwrites_existing_entry_with_allow_overwrite(self):
+        """allow_overwrite=True must silently replace the existing entry."""
         self.reg.load(TreeProjectBuilder())
         first_entry = self.reg.get_config("tree-app")
-        self.reg.load(TreeProjectBuilder())
+        self.reg.load(TreeProjectBuilder(), allow_overwrite=True)
         second_entry = self.reg.get_config("tree-app")
-        # Both are valid entries; overwrite must not raise.
         assert isinstance(second_entry, ProjectRegistryEntry)
         assert first_entry is not second_entry  # new object built each time
+
+    def test_load_raises_on_duplicate_without_allow_overwrite(self):
+        """load() without allow_overwrite=True must raise ValueError on duplicate."""
+        self.reg.load(TreeProjectBuilder())
+        with pytest.raises(ValueError, match="tree-app"):
+            self.reg.load(TreeProjectBuilder())
+
+    def test_register_raises_on_duplicate_without_allow_overwrite(self):
+        """register() without allow_overwrite=True must raise ValueError on duplicate."""
+        entry = TreeProjectBuilder().build()
+        self.reg.register("tree-app", entry)
+        with pytest.raises(ValueError, match="tree-app"):
+            self.reg.register("tree-app", entry)
 
     def test_registered_projects_returns_list(self):
         self.reg.load(TreeProjectBuilder())
@@ -215,15 +228,16 @@ class TestRegistry:
 
     def test_duplicate_load_second_entry_replaces_first(self):
         """
-        Loading the same project_id twice must silently overwrite — no error raised.
-        The second entry is the canonical one after the call returns.
+        Loading the same project_id twice with allow_overwrite=True must silently
+        overwrite — no error raised.  The second entry is the canonical one.
 
-        This is the documented idempotent re-registration contract used by bootstrap().
+        This documents the re-registration contract used by test fixtures.
+        Production bootstrap() catches ValueError and logs a warning instead.
         """
         self.reg.load(TreeProjectBuilder())
         first = self.reg.get_config("tree-app")
 
-        self.reg.load(TreeProjectBuilder())
+        self.reg.load(TreeProjectBuilder(), allow_overwrite=True)
         second = self.reg.get_config("tree-app")
 
         # No exception — the overwrite is intentional

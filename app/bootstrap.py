@@ -68,6 +68,15 @@ def bootstrap() -> None:
             ):
                 try:
                     registry.load(obj())
+                except ValueError as collision_err:
+                    # Collision guard fired — project_id already registered.
+                    # Log a warning and skip so bootstrap() remains idempotent
+                    # (safe to call multiple times, e.g. during hot-reload or tests).
+                    logger.warning(
+                        "bootstrap: project_id collision for builder %r — %s",
+                        obj.__name__,
+                        collision_err,
+                    )
                 except Exception:
                     logger.warning(
                         "bootstrap: failed to load project builder %r from %r — skipping.",

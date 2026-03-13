@@ -2,19 +2,20 @@
 Unit tests for app/services/scoring_service.py.
 
 Tests exercise ``process_submission()`` directly — no HTTP layer involved.
-All tests rely on the session-scoped ``_populate_registry`` fixture from
-conftest.py to ensure the tree-app project is registered before any call.
+All tests receive a ``db_session`` fixture (async SQLite, rolled back after
+each test) and pass it to the service so DB persistence is exercised without
+needing a real PostgreSQL instance.
 
-Coverage:
-  - Happy path response shape and field values
-  - RequiredValidations new role-weights schema fields
-  - Confidence score bounds
-  - Multiple distinct submissions produce distinct IDs
-  - Unknown project raises ProjectNotFoundError
-  - Invalid payload raises ValidationError (Stage 1 failure)
-  - Extreme payload values produce scores in [0, 100]
+Coverage
+--------
+- Happy path response shape and field values
+- RequiredValidations new role-weights schema fields
+- Confidence score bounds
+- Multiple distinct submissions produce distinct IDs
+- Unknown project raises ProjectNotFoundError
+- Invalid payload raises ValidationError (Stage 1 failure)
+- Extreme payload values produce scores in [0, 100]
 """
-
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -22,6 +23,7 @@ from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import ProjectNotFoundError
 from app.schemas.envelope import SubmissionEnvelope, SubmissionMetadata
@@ -54,35 +56,39 @@ def _envelope(
 
 # ── Happy path ────────────────────────────────────────────────────────────────
 
-async def test_process_submission_returns_scoring_result_response() -> None:
+async def test_process_submission_returns_scoring_result_response(
+    db_session: AsyncSession,
+) -> None:
     """Valid envelope → ScoringResultResponse with correct shape."""
-    result = await process_submission(_envelope())
-
+    result = await process_submission(_envelope(), db_session)
     assert isinstance(result, ScoringResultResponse)
     assert result.project_id == "tree-app"
     assert result.status == "pending_review"
 
 
-async def test_process_submission_submission_id_echoed() -> None:
+async def test_process_submission_submission_id_echoed(
+    db_session: AsyncSession,
+) -> None:
     """submission_id in response must match the one sent in the envelope."""
     envelope = _envelope()
-    result = await process_submission(envelope)
-
+    result = await process_submission(envelope, db_session)
     assert result.submission_id == envelope.metadata.submission_id
 
 
-async def test_process_submission_confidence_score_in_range() -> None:
+async def test_process_submission_confidence_score_in_range(
+    db_session: AsyncSession,
+) -> None:
     """confidence_score must be a float in [0, 100]."""
-    result = await process_submission(_envelope())
-
+    result = await process_submission(_envelope(), db_session)
     assert isinstance(result.confidence_score, float)
     assert 0.0 <= result.confidence_score <= 100.0
 
 
-async def test_process_submission_breakdown_non_empty() -> None:
+async def test_process_submission_breakdown_non_empty(
+    db_session: AsyncSession,
+) -> None:
     """Breakdown must contain at least one rule contribution."""
-    result = await process_submission(_envelope())
-
+    result = await process_submission(_envelope(), db_session)
     assert len(result.breakdown) > 0
     for entry in result.breakdown:
         assert 0.0 <= entry.score <= 1.0
@@ -90,119 +96,137 @@ async def test_process_submission_breakdown_non_empty() -> None:
         assert entry.weighted_score >= 0.0
 
 
-async def test_process_submission_required_validations_new_schema() -> None:
+async def test_process_submission_required_validations_new_schema(
+    db_session: AsyncSession,
+) -> None:
     """required_validations must expose threshold_score and role_weights (new role-weights pattern)."""
-    result = await process_submission(_envelope())
-
+    result = await process_submission(_envelope(), db_session)
     rv = result.required_validations
-    # New fields from the role-weights pattern
     assert rv.threshold_score >= 1
     assert isinstance(rv.role_weights, dict)
     assert len(rv.role_weights) > 0
-    # All weights must be non-negative integers
     for role, weight in rv.role_weights.items():
         assert isinstance(role, str)
         assert isinstance(weight, int)
         assert weight >= 0
-    # Unchanged legacy field
     assert rv.required_min_trust >= 0
     assert isinstance(rv.review_tier, str) and len(rv.review_tier) > 0
 
 
-async def test_process_submission_thresholds_ordered() -> None:
-    """Returned thresholds must satisfy auto_approve_min >= manual_review_min (2-boundary design)."""
-    result = await process_submission(_envelope())
+async def test_process_submission_thresholds_ordered(
+    db_session: AsyncSession,
+) -> None:
+    """Returned thresholds must satisfy auto_approve_min >= manual_review_min."""
+    result = await process_submission(_envelope(), db_session)
     t = result.thresholds
     assert t.auto_approve_min >= t.manual_review_min
 
 
-async def test_process_submission_created_at_is_datetime() -> None:
+async def test_process_submission_created_at_is_datetime(
+    db_session: AsyncSession,
+) -> None:
     """created_at must be a timezone-aware datetime."""
-    result = await process_submission(_envelope())
-
+    result = await process_submission(_envelope(), db_session)
     assert isinstance(result.created_at, datetime)
     assert result.created_at.tzinfo is not None
 
 
-async def test_process_submission_distinct_envelopes_produce_distinct_ids() -> None:
+async def test_process_submission_distinct_envelopes_produce_distinct_ids(
+    db_session: AsyncSession,
+) -> None:
     """Two separate envelopes with different UUIDs must echo their own submission_id."""
     e1 = _envelope()
     e2 = _envelope()
-    r1 = await process_submission(e1)
-    r2 = await process_submission(e2)
-
+    r1 = await process_submission(e1, db_session)
+    r2 = await process_submission(e2, db_session)
     assert r1.submission_id != r2.submission_id
     assert r1.submission_id == e1.metadata.submission_id
     assert r2.submission_id == e2.metadata.submission_id
 
 
+async def test_process_submission_idempotent_same_id_returns_stored(
+    db_session: AsyncSession,
+) -> None:
+    """Re-submitting the same submission_id must return the stored result unchanged."""
+    envelope = _envelope()
+    r1 = await process_submission(envelope, db_session)
+    r2 = await process_submission(envelope, db_session)
+    assert r1.submission_id == r2.submission_id
+    assert r1.confidence_score == r2.confidence_score
+    assert r1.status == r2.status
+
+
 # ── Governance tier routing via confidence score ──────────────────────────────
 
-async def test_low_trust_submission_lands_in_stricter_tier() -> None:
-    """A submission from a low-trust user typically scores lower and gets a stricter tier."""
-    result_low = await process_submission(_envelope(trust_level=1))
-    result_high = await process_submission(_envelope(trust_level=100))
-
-    # Lower trust → lower pipeline score → stricter (or equal) tier
-    # We only assert the score is in range; governance routing is config-driven
+async def test_low_trust_submission_lands_in_stricter_tier(
+    db_session: AsyncSession,
+) -> None:
+    """A submission from a low-trust user typically scores lower."""
+    result_low = await process_submission(_envelope(trust_level=1), db_session)
+    result_high = await process_submission(_envelope(trust_level=100), db_session)
     assert 0.0 <= result_low.confidence_score <= 100.0
     assert 0.0 <= result_high.confidence_score <= 100.0
-    # High-trust submission should score at least as high
     assert result_high.confidence_score >= result_low.confidence_score
 
 
 # ── Extreme payload values ────────────────────────────────────────────────────
 
-async def test_process_submission_max_height_gives_score_in_range() -> None:
-    """Payload with very large height (well above h_max) clamps to score in [0, 100]."""
+async def test_process_submission_max_height_gives_score_in_range(
+    db_session: AsyncSession,
+) -> None:
+    """Payload with very large height clamps to score in [0, 100]."""
     payload = _payload(height=9999.0).model_dump(mode="json")
-    result = await process_submission(_envelope(payload=payload))
-
+    result = await process_submission(_envelope(payload=payload), db_session)
     assert 0.0 <= result.confidence_score <= 100.0
 
 
-async def test_process_submission_inclination_at_90_gives_score_in_range() -> None:
+async def test_process_submission_inclination_at_90_gives_score_in_range(
+    db_session: AsyncSession,
+) -> None:
     """Boundary inclination (90°) is accepted and scores in [0, 100]."""
     payload = _payload(inclination=90).model_dump(mode="json")
-    result = await process_submission(_envelope(payload=payload))
-
+    result = await process_submission(_envelope(payload=payload), db_session)
     assert 0.0 <= result.confidence_score <= 100.0
 
 
 # ── Unknown project ───────────────────────────────────────────────────────────
 
-async def test_process_submission_unknown_project_raises_project_not_found_error() -> None:
+async def test_process_submission_unknown_project_raises_project_not_found_error(
+    db_session: AsyncSession,
+) -> None:
     """Unknown project_id must raise ProjectNotFoundError before any scoring runs."""
     envelope = _envelope(project_id="no-such-project")
-
     with pytest.raises(ProjectNotFoundError, match="no-such-project"):
-        await process_submission(envelope)
+        await process_submission(envelope, db_session)
 
 
 # ── Stage 1 validation failure ────────────────────────────────────────────────
 
-async def test_process_submission_invalid_payload_raises_validation_error() -> None:
+async def test_process_submission_invalid_payload_raises_validation_error(
+    db_session: AsyncSession,
+) -> None:
     """Payload that fails Stage 1 schema validation must raise ValidationError."""
     bad_payload = {"tree_id": "not-a-uuid", "completely": "wrong"}
     envelope = _envelope(payload=bad_payload)
-
     with pytest.raises(ValidationError):
-        await process_submission(envelope)
+        await process_submission(envelope, db_session)
 
 
-async def test_process_submission_empty_payload_raises_validation_error() -> None:
+async def test_process_submission_empty_payload_raises_validation_error(
+    db_session: AsyncSession,
+) -> None:
     """Completely empty payload must fail Stage 1 with ValidationError."""
     envelope = _envelope(payload={})
-
     with pytest.raises(ValidationError):
-        await process_submission(envelope)
+        await process_submission(envelope, db_session)
 
 
-async def test_process_submission_missing_tree_id_raises_validation_error() -> None:
+async def test_process_submission_missing_tree_id_raises_validation_error(
+    db_session: AsyncSession,
+) -> None:
     """Payload missing required tree_id must fail Stage 1."""
     payload = _payload().model_dump(mode="json")
     del payload["tree_id"]
     envelope = _envelope(payload=payload)
-
     with pytest.raises(ValidationError):
-        await process_submission(envelope)
+        await process_submission(envelope, db_session)
