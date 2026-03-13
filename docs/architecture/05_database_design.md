@@ -3,7 +3,7 @@
 > Comprehensive planning document for Winnow's PostgreSQL persistence layer (Sprint 3).
 > **No implementation code is included.** This document defines the schema, analyses edge cases, and records architectural decisions that will guide the SQLAlchemy 2.0 + Alembic implementation.
 >
-> **Last updated:** Sprint 3 Phase 1 — all open "Proposed" ADRs resolved; schema synced with Sprint 2.6 governance engine (role-weights, `pending_review` status, `superseded_by` column, full 4-table migration plan).
+> **Last updated:** Sprint 3 Phase 2 — `confidence_score` relocated from `submissions` to `scoring_results` (ADR-DB-008); infra alignment: `ALEMBIC_CONFIG` env var, project-root-relative `script_location`, `dev_venv` volume removed, PostgreSQL port exposed in `compose.dev.yaml`.
 
 **Terminology reminder:** *"Validation"* = Stage 1 (Pydantic schema checks). *"Scoring"* = Stage 2 (Confidence Score factors). *"Trust Evaluation & Advisory"* = Stage 4 — dual role: (a) Tₙ as scoring input, (b) `trust_adjustment` recommendation after ground-truth finalization. See `01_project_structure.md` for the full convention.
 
@@ -555,15 +555,36 @@ WHERE user_id = :user_id
 | **Rationale** | (1) One ORM model, one Alembic migration. (2) Cross-project admin queries are trivial. (3) PostgreSQL declarative partitioning by `project_id` can be added transparently via migration if volume demands it — the application layer requires zero changes. (4) For the thesis prototype with a single project, per-project tables add complexity with no benefit. |
 | **Scaling path** | When Winnow serves multiple high-volume projects: `ALTER TABLE submissions PARTITION BY LIST (project_id)`. Each partition vacuums independently. Application code unchanged. |
 
+### ADR-DB-008: `confidence_score` Stored in `scoring_results`, Not `submissions`
+
+| Field | Value |
+|---|---|
+| **Status** | Accepted — implemented in Sprint 3 Phase 2 |
+| **Context** | `confidence_score` is a computed output of the scoring pipeline. It could be stored as a column on `submissions` for query convenience, or in `scoring_results` alongside the rest of the pipeline output. |
+| **Decision** | Store `confidence_score` exclusively in `scoring_results`. Remove it from the `submissions` table. |
+| **Rationale** | (1) **Submission immutability.** The `submissions` table is a point-in-time INPUT snapshot of the received envelope. A computed OUTPUT field on an immutable row is semantically incorrect and creates an ambiguous write pattern. (2) **Future re-scoring.** Phase 2 may introduce re-scoring (e.g., updated rule weights). `scoring_results` is designed to hold multiple results per submission (relaxing the `UNIQUE` constraint). A `confidence_score` on `submissions` would become stale on re-score and require an UPDATE — violating the append-only principle. (3) **Separation of concerns.** All pipeline outputs (`breakdown`, `required_validations`, `thresholds`, `trust_adjustment`) already live in `scoring_results`. `confidence_score` is one more pipeline output and belongs with its siblings. |
+| **Performance trade-off** | Dashboard and leaderboard queries that filter or sort by `confidence_score` now require a JOIN between `submissions` and `scoring_results`. This JOIN is on an indexed FK (`ix_scoring_results_submission_id`) and is efficient for prototype-scale workloads. Combined filters like `WHERE project_id = ? AND confidence_score >= ?` become a two-table query. |
+| **Future mitigation** | If profiling reveals the JOIN is a bottleneck at scale, the following options are available without violating architectural principles: (1) a covering index on `(submission_id, confidence_score)` in `scoring_results`; (2) a PostgreSQL materialised view pre-joining the two tables, refreshed on a schedule or trigger; (3) explicit intentional denormalisation — a read-model `confidence_score` column on `submissions` alongside the canonical value in `scoring_results`, documented as a new ADR at that time. Architectural purity takes priority in the current phase. |
+| **Consequences** | All service-layer code reads `confidence_score` from the `ScoringResult` ORM row (`sr_row.confidence_score`), never from `Submission`. The `CHECK (0 <= confidence_score <= 100)` constraint and `ix_scoring_results_confidence_score` index are both enforced on `scoring_results`. |
+
 ---
 
 ## 4. Migration Strategy
 
 ### 4.1 Alembic Configuration
-
 - **Async driver:** Use `asyncpg` via SQLAlchemy's `create_async_engine`. Alembic's `env.py` will use `run_async()` to execute migrations.
 - **Autogenerate:** Enable Alembic autogenerate against `Base.metadata` from `app/models/base.py`.
 - **Naming convention:** Use SQLAlchemy's `MetaData(naming_convention=...)` to produce deterministic, human-readable constraint names (e.g., `pk_submissions`, `fk_scoring_results_submission_id`, `uq_submission_votes_submission_id_user_id`).
+- **Config file location:** `alembic.ini` lives at `app/db/migrations/alembic.ini`. The `script_location` inside it is set to `app/db/migrations` (relative to the **project root**, not the config file). This means Alembic must always be invoked from the project root or via the `ALEMBIC_CONFIG` environment variable.
+- **`ALEMBIC_CONFIG` env var:** Set `ALEMBIC_CONFIG=app/db/migrations/alembic.ini` in `.env` (and `.env.example`). This tells the Alembic CLI where to find its config regardless of the working directory. Example: `alembic upgrade head` works from the project root without a `-c` flag when `ALEMBIC_CONFIG` is exported.
+
+### 4.4 Development Environment Notes
+The following `compose.dev.yaml` changes were applied in Sprint 3 Phase 2 to align the dev environment with the production image and improve local DB access:
+
+| Change | Rationale |
+|---|---|
+| **`dev_venv` volume removed** | The named volume was used to persist the Python virtual environment across container restarts. Removing it ensures dependencies are always sourced directly from the built image (`/opt/venv` baked in during `docker build`). This eliminates stale-dependency bugs caused by the volume shadowing the image's `site-packages`. |
+| **PostgreSQL port `5432:5432` exposed** | The `db` service now publishes port 5432 to the host. This enables direct local DB access via `psql`, a GUI client (e.g., DataGrip), or `alembic upgrade head` run outside Docker without a tunnel. **Not** exposed in `compose.yaml` (production) — only in `compose.dev.yaml`. |
 
 ### 4.2 Initial Migration — Sprint 3 (All Four Tables)
 
@@ -680,5 +701,8 @@ The following sequence defines the order in which Sprint 3 code will be written.
 | SQLAlchemy model design notes | §5 |
 | Formal ADRs for all decisions (all Accepted) | §3 |
 | Sprint 3 step-by-step implementation plan | §6 |
+| `confidence_score` relocation rationale and trade-offs | ADR-DB-008 |
+| Alembic `ALEMBIC_CONFIG` env var and `script_location` | §4.1 |
+| Dev environment infra changes (`dev_venv`, PG port) | §4.4 |
 
-**All architectural decisions are now in `Accepted` status. No open trade-offs remain. Sprint 3 implementation may begin.**
+**All architectural decisions are now in `Accepted` status. No open trade-offs remain. The codebase, migration, and documentation are fully synchronised.**

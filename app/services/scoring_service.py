@@ -116,10 +116,10 @@ async def process_submission(
         user_context=envelope.user_context.model_dump(mode="json"),
         raw_payload=validated_payload.model_dump(mode="json"),
         status=SubmissionStatus.PENDING_REVIEW,
-        confidence_score=pipeline_result.total_score,
     )
     sr_row = ScoringResult(
         submission_id=submission_id,
+        confidence_score=pipeline_result.total_score,
         breakdown=[r.model_dump(mode="json") for r in breakdown],
         required_validations=required.model_dump(mode="json"),
         thresholds=config.thresholds.model_dump(mode="json"),
@@ -264,7 +264,7 @@ def _build_response_from_orm(
         submission_id=submission.submission_id,
         project_id=submission.project_id,
         status=submission.status,
-        confidence_score=submission.confidence_score,
+        confidence_score=sr_row.confidence_score,
         breakdown=breakdown,
         required_validations=required,
         thresholds=thresholds,

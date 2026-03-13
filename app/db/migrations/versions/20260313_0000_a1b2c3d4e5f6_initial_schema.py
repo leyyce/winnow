@@ -51,7 +51,6 @@ def upgrade() -> None:
             nullable=False,
             server_default="pending_review",
         ),
-        sa.Column("confidence_score", sa.Float(), nullable=False),
         sa.Column("superseded_by", sa.Uuid(), nullable=True),
         sa.Column(
             "created_at",
@@ -95,6 +94,12 @@ def upgrade() -> None:
         "scoring_results",
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("submission_id", sa.Uuid(), nullable=False),
+        # Computed output — stored here, NOT in submissions (immutability / re-scoring)
+        sa.Column("confidence_score", sa.Float(), nullable=False),
+        sa.CheckConstraint(
+            "confidence_score >= 0 AND confidence_score <= 100",
+            name="ck_scoring_results_confidence_score",
+        ),
         sa.Column(
             "breakdown",
             postgresql.JSONB(astext_type=sa.Text()),
@@ -126,6 +131,8 @@ def upgrade() -> None:
         sa.UniqueConstraint("submission_id", name="uq_scoring_results_submission_id"),
     )
     op.create_index("ix_scoring_results_submission_id", "scoring_results", ["submission_id"])
+    # Range queries for dashboards / leaderboards: WHERE confidence_score >= X
+    op.create_index("ix_scoring_results_confidence_score", "scoring_results", ["confidence_score"])
 
     # ── submission_votes ──────────────────────────────────────────────────────
     op.create_table(

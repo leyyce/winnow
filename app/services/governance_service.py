@@ -88,7 +88,7 @@ async def get_available_tasks(
     for submission, sr_row in rows:
         required = RequiredValidations.model_validate(sr_row.required_validations)
         if config.governance_policy.is_eligible_reviewer(
-            submission_score=submission.confidence_score,
+            submission_score=sr_row.confidence_score,
             submission_requirements=required,
             reviewer_trust=user_trust,
             reviewer_role=user_role,
@@ -98,7 +98,7 @@ async def get_available_tasks(
                     submission_id=submission.submission_id,
                     project_id=submission.project_id,
                     submission_type=submission.submission_type,
-                    confidence_score=submission.confidence_score,
+                    confidence_score=sr_row.confidence_score,
                     review_tier=required.review_tier,
                     required_validations=required,
                     submitted_at=submission.created_at,

@@ -85,8 +85,6 @@ class Submission(Base, TimestampMixin):
         default=SubmissionStatus.PENDING_REVIEW,
         index=True,
     )
-    confidence_score: Mapped[float] = mapped_column(nullable=False)
-
     # Self-referential FK — set when this submission is superseded by another
     superseded_by: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey(

@@ -30,6 +30,8 @@ services:
       POSTGRES_USER: winnow
       POSTGRES_PASSWORD: winnow
       POSTGRES_DB: winnow
+    ports:
+      - "5432:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
     healthcheck:
@@ -54,7 +56,7 @@ services:
       # Lives outside the bind-mount tree so the host source never shadows it.
       # Persists across restarts and plain `docker compose down`.
       # Refreshed automatically on `docker compose up --build`.
-      - dev_venv:/opt/venv
+      # - dev_venv:/opt/venv
     env_file:
       - .env
     expose:
@@ -89,6 +91,6 @@ services:
 
 volumes:
   pg_data:
-  dev_venv:
+  # dev_venv:
   caddy_data:
   caddy_config:

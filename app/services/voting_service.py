@@ -94,7 +94,7 @@ async def cast_vote(
     # Step 4 — check reviewer eligibility
     config = registry.get_config(submission.project_id)
     is_eligible = config.governance_policy.is_eligible_reviewer(
-        submission_score=submission.confidence_score,
+        submission_score=sr_row.confidence_score,
         submission_requirements=required,
         reviewer_trust=request.user_trust_level,
         reviewer_role=request.user_role,
@@ -170,7 +170,7 @@ async def cast_vote(
             submission_id=submission_id,
             project_id=submission.project_id,
             final_status=threshold_result,
-            confidence_score=submission.confidence_score,
+            confidence_score=sr_row.confidence_score,
             user_context=submission.user_context,
             tally=tally,
             db=db,

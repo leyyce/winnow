@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import DateTime, ForeignKey, func
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
@@ -53,7 +53,8 @@ class ScoringResult(Base):
         unique=True,   # enforces the 1:1 relationship at DB level
         index=True,
     )
-
+    # Computed output — belongs here, NOT in submissions (immutability / re-scoring)
+    confidence_score: Mapped[float] = mapped_column(nullable=False)
     # Per-rule breakdown: list[{rule, weight, score, weighted_score, details}]
     breakdown: Mapped[list] = mapped_column(
         JSONB().with_variant(JSON(), "sqlite"),
@@ -77,6 +78,13 @@ class ScoringResult(Base):
         server_default=func.now(),
     )
 
+    # ── Table-level constraints ─────────────────────────────────────────────
+    __table_args__ = (
+        CheckConstraint(
+            "confidence_score >= 0 AND confidence_score <= 100",
+            name="ck_scoring_results_confidence_score",
+        ),
+    )
     # ── Relationship ──────────────────────────────────────────────────────────
     submission: Mapped[Submission] = relationship(
         "Submission",
