@@ -25,15 +25,17 @@ from app.tests.conftest import _ctx, _payload
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _valid_envelope(project_id: str = "tree-app") -> dict:
+def _valid_envelope(project_id: str = "tree-app", trust_level: int = 50) -> dict:
     """Return a serialisable dict representing a valid SubmissionEnvelope."""
-    ctx = _ctx(trust_level=50)
+    ctx = _ctx(trust_level=trust_level)
     payload = _payload()
     return {
         "metadata": {
             "project_id": project_id,
             "submission_id": str(uuid4()),
-            "submission_type": "tree_measurement",
+            "entity_type": "tree_measurement",
+            "entity_id": str(uuid4()),
+            "measurement_id": str(uuid4()),
             "submitted_at": datetime(2024, 1, 1, tzinfo=timezone.utc).isoformat(),
         },
         "user_context": {
@@ -244,18 +246,21 @@ async def test_post_submission_required_validations_has_threshold_score(
     assert rv["threshold_score"] >= 1
 
 
-async def test_post_submission_required_validations_has_role_weights(
+async def test_post_submission_required_validations_has_role_configs(
     async_client: AsyncClient,
 ) -> None:
-    """required_validations must contain role_weights dict with str keys."""
+    """required_validations must contain role_configs, default_config, blocked_roles (Sprint 5)."""
     response = await async_client.post("/api/v1/submissions", json=_valid_envelope())
     rv = response.json()["required_validations"]
 
-    assert "role_weights" in rv
-    assert isinstance(rv["role_weights"], dict)
-    for role, weight in rv["role_weights"].items():
+    assert "role_configs" in rv
+    assert "default_config" in rv
+    assert "blocked_roles" in rv
+    assert isinstance(rv["role_configs"], dict)
+    assert isinstance(rv["blocked_roles"], list)
+    for role, cfg in rv["role_configs"].items():
         assert isinstance(role, str)
-        assert isinstance(weight, int)
+        assert "weight" in cfg and "min_trust" in cfg
 
 
 async def test_post_submission_required_validations_no_old_fields(

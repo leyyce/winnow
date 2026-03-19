@@ -161,7 +161,6 @@ def _payload(
     if photos is None:
         photos = [TreePhotoPayload(path="a.jpg"), TreePhotoPayload(path="b.jpg")]
     return TreePayload(
-        tree_id=uuid4(),
         species_id=uuid4(),
         measurement=TreeMeasurementPayload(
             height=height,

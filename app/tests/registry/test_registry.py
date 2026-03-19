@@ -285,10 +285,8 @@ class TestRegistry:
 
 class TestTreeProjectBuilderGovernance:
     """
-    Verify that the tree-app registry entry carries the new role-weights governance
-    fields on every tier. These tests act as a contract guard: if someone modifies
-    the registry builder and accidentally drops threshold_score or role_weights,
-    a test failure here surfaces the breakage immediately.
+    Verify that the tree-app registry entry carries the Sprint 5 role_configs /
+    default_config / blocked_roles governance fields on every tier.
     """
 
     def setup_method(self):
@@ -304,53 +302,48 @@ class TestTreeProjectBuilderGovernance:
                 f"Tier '{tier.review_tier}' has invalid threshold_score={tier.threshold_score}"
             )
 
-    def test_all_tiers_have_non_empty_role_weights(self):
+    def test_all_tiers_have_role_configs_dict(self):
         for tier in self.policy._tiers:
-            assert isinstance(tier.role_weights, dict), (
-                f"Tier '{tier.review_tier}' role_weights is not a dict"
-            )
-            assert len(tier.role_weights) > 0, (
-                f"Tier '{tier.review_tier}' role_weights is empty"
+            assert isinstance(tier.role_configs, dict), (
+                f"Tier '{tier.review_tier}' role_configs is not a dict"
             )
 
-    def test_all_role_weights_are_non_negative_integers(self):
+    def test_all_role_configs_have_non_negative_weights(self):
         for tier in self.policy._tiers:
-            for role, weight in tier.role_weights.items():
-                assert isinstance(weight, int), (
-                    f"Tier '{tier.review_tier}' role '{role}' weight is not int"
-                )
-                assert weight >= 0, (
+            for role, cfg in tier.role_configs.items():
+                assert cfg.weight >= 0, (
                     f"Tier '{tier.review_tier}' role '{role}' weight is negative"
                 )
+                assert cfg.min_trust >= 0, (
+                    f"Tier '{tier.review_tier}' role '{role}' min_trust is negative"
+                )
 
-    def test_all_tiers_have_non_negative_required_min_trust(self):
+    def test_all_tiers_have_valid_default_config(self):
         for tier in self.policy._tiers:
-            assert tier.required_min_trust >= 0
+            assert tier.default_config.weight >= 0
+            assert tier.default_config.min_trust >= 0
 
     def test_tiers_sorted_descending_by_score_threshold(self):
         thresholds = [t.score_threshold for t in self.policy._tiers]
         assert thresholds == sorted(thresholds, reverse=True)
 
     def test_expert_review_tier_excludes_citizen(self):
-        """expert_review tier must have citizen weight=0 (or absent) to enforce expert-only."""
+        """expert_review tier: citizen absent from role_configs; default_config unreachable."""
         expert_tier = next(
             (t for t in self.policy._tiers if t.review_tier == "expert_review"), None
         )
         assert expert_tier is not None, "expert_review tier not found"
-        assert expert_tier.role_weights.get("citizen", 0) == 0
+        # citizen not in explicit role_configs for expert_review
+        assert "citizen" not in expert_tier.role_configs
 
     def test_community_review_tier_expert_weight_exceeds_citizen(self):
-        """
-        In community_review, expert weight must be > citizen weight to allow
-        single-expert finalization when citizens need multiple votes.
-        """
+        """In community_review, expert weight must exceed citizen weight."""
         community_tier = next(
             (t for t in self.policy._tiers if t.review_tier == "community_review"), None
         )
         assert community_tier is not None, "community_review tier not found"
-        citizen_w = community_tier.role_weights.get("citizen", 0)
-        expert_w = community_tier.role_weights.get("expert", 0)
+        citizen_w = community_tier.role_configs.get("citizen").weight if "citizen" in community_tier.role_configs else 0
+        expert_w = community_tier.role_configs.get("expert").weight if "expert" in community_tier.role_configs else 0
         assert expert_w > citizen_w, (
-            f"expert weight ({expert_w}) must exceed citizen weight ({citizen_w}) "
-            f"so a single expert can meet the threshold alone"
+            f"expert weight ({expert_w}) must exceed citizen weight ({citizen_w})"
         )

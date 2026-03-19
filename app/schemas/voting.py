@@ -32,8 +32,11 @@ class VoteRequest(BaseModel):
     user_id: UUID = Field(
         description="Stable reviewer identifier from the client system.",
     )
-    vote: Literal["approve", "reject"] = Field(
-        description="The reviewer's decision: approve or reject the submission.",
+    vote: Literal["approve", "reject", "voided"] = Field(
+        description=(
+            "The reviewer's decision. Normal votes: 'approve' or 'reject'. "
+            "Admin override votes (is_override=True) may additionally use 'voided'."
+        ),
     )
     user_trust_level: int = Field(
         ge=0,
@@ -42,6 +45,15 @@ class VoteRequest(BaseModel):
     user_role: str = Field(
         min_length=1,
         description="Reviewer's role in the client system (e.g. 'citizen', 'expert').",
+    )
+    is_override: bool = Field(
+        default=False,
+        description=(
+            "Admin-only flag. When True, this vote is a Power-Vote Override: "
+            "eligibility checks are bypassed and the submission is immediately "
+            "forced into the specified terminal state. "
+            "Must only be set by a trusted admin caller."
+        ),
     )
     note: str | None = Field(
         default=None,
@@ -83,7 +95,7 @@ class VoteResponse(BaseModel):
     threshold_met: bool = Field(
         description="Whether the governance threshold was met by this vote.",
     )
-    final_status: Literal["approved", "rejected"] | None = Field(
+    final_status: str | None = Field(
         default=None,
         description="Final status if threshold was met; None otherwise.",
     )

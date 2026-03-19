@@ -6,6 +6,14 @@ project-specific domain data inside a strictly-typed, project-agnostic outer
 structure. The `payload` field is intentionally kept as `dict[str, Any]` so the
 envelope remains decoupled from any single project's data shape; project-specific
 Stage 1 validation is deferred to the registry-resolved Pydantic schema.
+
+Refinement Sprint changes:
+* `submission_type` renamed to `entity_type` — aligns with domain terminology.
+* `entity_id` and `measurement_id` added to `SubmissionMetadata` — these are the
+  identity triplet fields that, together with `project_id`, uniquely identify and
+  version a domain measurement.  They were previously embedded in project-specific
+  payloads (e.g. `tree_id` in `TreePayload`) which violated DRY and made it
+  impossible to enforce the triplet contract at the envelope level.
 """
 
 from __future__ import annotations
@@ -26,9 +34,24 @@ class SubmissionMetadata(BaseModel):
     submission_id: UUID = Field(
         description="Client-generated UUID — used for idempotency checks.",
     )
-    submission_type: str = Field(
+    entity_type: str = Field(
         min_length=1,
-        description="Submission variant within the project, e.g. 'tree_measurement'.",
+        description=(
+            "Submission variant within the project, e.g. 'tree_measurement'. "
+            "Must match one of the project's configured valid_entity_types."
+        ),
+    )
+    entity_id: UUID = Field(
+        description=(
+            "UUID of the domain entity in the client system "
+            "(e.g. the tree being measured). Part of the identity triplet."
+        ),
+    )
+    measurement_id: UUID = Field(
+        description=(
+            "UUID of the specific measurement event in the client system. "
+            "Part of the identity triplet."
+        ),
     )
     submitted_at: AwareDatetime = Field(
         description="ISO-8601 timestamp (with timezone) of when the client built the envelope.",
@@ -68,6 +91,17 @@ class UserContext(BaseModel):
     account_created_at: AwareDatetime = Field(
         description="ISO-8601 timestamp of account creation; changes only once.",
     )
+    account_updated_at: AwareDatetime | None = Field(
+        default=None,
+        description=(
+            "ISO-8601 timestamp of the last account update.  Optional — when "
+            "omitted the scoring service falls back to account_created_at."
+        ),
+    )
+    custom_data: dict | None = Field(
+        default=None,
+        description="Project-specific user metadata forwarded to the user snapshot.",
+    )
 
 
 class SubmissionEnvelope(BaseModel):
@@ -75,7 +109,7 @@ class SubmissionEnvelope(BaseModel):
     Top-level request body for POST /api/v1/submissions.
 
     The envelope separates three concerns:
-    - `metadata`     — routing and idempotency data (always validated here).
+    - `metadata`     — routing, idempotency, and entity identity (always validated here).
     - `user_context` — user snapshot for scoring and governance (always validated here).
     - `payload`      — raw domain data; accepted as a generic dict and validated
                        separately by the project-specific Pydantic schema (Stage 1).

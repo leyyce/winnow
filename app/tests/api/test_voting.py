@@ -21,15 +21,17 @@ from app.tests.conftest import _ctx, _payload
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _valid_envelope(project_id: str = "tree-app") -> dict:
+def _valid_envelope(project_id: str = "tree-app", trust_level: int = 50) -> dict:
     """Return a serialisable dict representing a valid SubmissionEnvelope."""
-    ctx = _ctx(trust_level=50)
+    ctx = _ctx(trust_level=trust_level)
     payload = _payload()
     return {
         "metadata": {
             "project_id": project_id,
             "submission_id": str(uuid4()),
-            "submission_type": "tree_measurement",
+            "entity_type": "tree_measurement",
+            "entity_id": str(uuid4()),
+            "measurement_id": str(uuid4()),
             "submitted_at": datetime(2024, 1, 1, tzinfo=timezone.utc).isoformat(),
         },
         "user_context": {
@@ -132,7 +134,7 @@ async def test_vote_threshold_met_approval(async_client: AsyncClient) -> None:
     body = r2.json()
     assert body["threshold_met"] is True
     assert body["final_status"] == "approved"
-    assert "Webhook notification queued" in body["message"]
+    assert "approved" in body["message"].lower()
 
 
 async def test_vote_threshold_met_rejection(async_client: AsyncClient) -> None:
@@ -167,23 +169,26 @@ async def test_vote_submission_not_found_returns_404(async_client: AsyncClient) 
 
 # ── Error: duplicate vote ─────────────────────────────────────────────────────
 
-async def test_vote_duplicate_returns_409(async_client: AsyncClient) -> None:
-    """Same user_id voting twice on the same submission → 409."""
+async def test_vote_same_user_twice_is_append_only(async_client: AsyncClient) -> None:
+    """Sprint 5: Same user voting twice is append-only — both succeed, tally uses latest."""
     sid = await _submit_and_get_id(async_client)
     user_id = str(uuid4())
 
     r1 = await async_client.post(
         f"/api/v1/submissions/{sid}/votes",
-        json=_vote_body(user_id=user_id),
+        json=_vote_body(user_id=user_id, trust=50),
     )
     assert r1.status_code == 201
+    assert r1.json()["threshold_met"] is False  # weight=1, threshold=2
 
+    # Same user votes again — appended, still only counts once in tally
     r2 = await async_client.post(
         f"/api/v1/submissions/{sid}/votes",
-        json=_vote_body(user_id=user_id),
+        json=_vote_body(user_id=user_id, trust=50),
     )
-    assert r2.status_code == 409
-    assert r2.json()["type"].endswith("/errors/duplicate-vote")
+    assert r2.status_code == 201
+    # Still weight=1 from this user — threshold NOT met (single user can't reach 2)
+    assert r2.json()["threshold_met"] is False
 
 
 # ── Error: already finalized ──────────────────────────────────────────────────
@@ -252,7 +257,14 @@ async def test_vote_finalization_creates_outbox_entry(
     async_client: AsyncClient,
     db_session: AsyncSession,
 ) -> None:
-    """When threshold is met, a webhook outbox entry must be created in the DB."""
+    """
+    When threshold is met, webhook outbox entries must be created.
+
+    Expected entries in the DB after a full submission + 2 votes:
+    * 1 entry from process_submission (initial status transition)
+    * 1 entry from the vote that meets the threshold (finalization transition)
+    Total: 2 pending outbox entries for the submission.
+    """
     sid = await _submit_and_get_id(async_client)
 
     # First citizen vote — weight=1, threshold=2, not met yet
@@ -268,9 +280,15 @@ async def test_vote_finalization_creates_outbox_entry(
 
     # Query DB directly — db_session shares the same SQLite engine as async_client
     pending = await webhook_service.get_pending_entries(db_session)
-    assert len(pending) == 1
-    assert str(pending[0].submission_id) == sid
-    assert pending[0].event_type == "submission.finalized"
+    submission_entries = [e for e in pending if str(e.submission_id) == sid]
+    # 1 initial status webhook + 1 finalization webhook = 2 total
+    assert len(submission_entries) == 2
+    event_types = {e.event_type for e in submission_entries}
+    assert "submission.created" in event_types
+    assert any(et in event_types for et in ("submission.approved", "submission.rejected"))
+    # The final entry payload carries the terminal status
+    final_entry = max(submission_entries, key=lambda e: e.created_at)
+    assert final_entry.payload["new_status"] in ("approved", "rejected")
 
 
 # ── Role-weights threshold edge cases ────────────────────────────────────────
@@ -328,15 +346,13 @@ async def test_vote_ineligible_role_not_in_weights_returns_403(
     async_client: AsyncClient,
 ) -> None:
     """
-    A role absent from role_weights (e.g. 'moderator') must be rejected with 403.
-
-    Unlike the old required_role check, ineligibility is now determined purely
-    by the role_weights dict — any role with weight 0 or absent is ineligible.
+    Sprint 5: a blocked role ('guest') is absolutely ineligible regardless of trust.
+    blocked_roles takes precedence over role_configs and default_config.
     """
     sid = await _submit_and_get_id(async_client)
     response = await async_client.post(
         f"/api/v1/submissions/{sid}/votes",
-        json=_vote_body(trust=50, role="moderator"),
+        json=_vote_body(trust=9999, role="guest"),
     )
     assert response.status_code == 403
     assert response.json()["type"].endswith("/errors/not-eligible")
@@ -402,26 +418,31 @@ async def test_vote_404_rfc7807_body_has_required_fields(
     assert fake_id in body["detail"]
 
 
-async def test_vote_409_duplicate_rfc7807_body_has_required_fields(
+async def test_vote_409_already_finalized_rfc7807_body_has_required_fields(
     async_client: AsyncClient,
 ) -> None:
-    """409 body for duplicate vote must be a complete RFC 7807 ProblemDetail."""
+    """Sprint 5: duplicate votes are append-only. 409 only fires for already-finalized."""
     sid = await _submit_and_get_id(async_client)
-    user_id = str(uuid4())
 
+    # Finalize via two citizen approvals (different users)
     await async_client.post(
         f"/api/v1/submissions/{sid}/votes",
-        json=_vote_body(user_id=user_id, trust=50),
+        json=_vote_body(trust=50),
     )
+    await async_client.post(
+        f"/api/v1/submissions/{sid}/votes",
+        json=_vote_body(trust=50),
+    )
+    # Third vote on finalized submission → 409 already-finalized
     response = await async_client.post(
         f"/api/v1/submissions/{sid}/votes",
-        json=_vote_body(user_id=user_id, trust=50),
+        json=_vote_body(trust=50),
     )
     body = response.json()
 
     assert response.status_code == 409
-    assert body["type"].endswith("/errors/duplicate-vote")
-    assert body["title"] == "Duplicate Vote"
+    assert body["type"].endswith("/errors/already-finalized")
+    assert body["title"] == "Already Finalized"
     assert body["status"] == 409
     assert "instance" in body
 

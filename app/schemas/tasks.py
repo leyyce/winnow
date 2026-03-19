@@ -34,9 +34,9 @@ class TaskItem(BaseModel):
         min_length=1,
         description="Project this submission belongs to.",
     )
-    submission_type: str = Field(
+    entity_type: str = Field(
         min_length=1,
-        description="Submission variant within the project, e.g. 'tree_measurement'.",
+        description="Entity type within the project, e.g. 'tree_measurement'.",
     )
     confidence_score: float = Field(
         ge=0.0,

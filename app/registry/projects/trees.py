@@ -7,9 +7,18 @@ This module is the single authoritative "Composer" that wires together:
   - Stage 4-output trust advisor  (app.scoring.common.trust_advisor)
   - Governance policy  (app.governance.projects.trees)
 
+Sprint 5 upgrade: GovernanceTier now uses ``role_configs`` / ``default_config``
+/ ``blocked_roles`` instead of the flat ``role_weights`` + ``required_min_trust``
+pattern.  This enables per-role trust minimums and absolute role blocking.
+
 ALL numeric parameters (weights, thresholds, trust scales, penalty values)
 are defined here and injected into rule/policy constructors.
 No magic numbers live inside rule or policy implementations (Rule 3).
+
+References
+----------
+* Rule 3: Configuration is King
+* Rule 7: Iterative Implementation
 """
 from __future__ import annotations
 
@@ -17,7 +26,7 @@ from app.governance.projects.trees import GovernanceTier, TreeGovernancePolicy
 from app.registry.base import ProjectBuilder
 from app.registry.manager import ProjectRegistryEntry
 from app.schemas.projects.trees import TreePayload
-from app.schemas.results import ThresholdConfig
+from app.schemas.results import RoleConfig, ThresholdConfig
 from app.scoring.base import ScoringRule
 from app.scoring.common.trust_advisor import TrustAdvisor, TrustAdvisorConfig
 from app.scoring.common.trust_level import TrustLevelRule
@@ -42,7 +51,6 @@ class TreeProjectBuilder(ProjectBuilder):
 
     def build(self) -> ProjectRegistryEntry:
         # ── Scoring weights ──────────────────────────────────────────────────
-        # Example weights from the design document; tune based on empirical data.
         W_HEIGHT = 0.20
         W_DISTANCE = 0.20
         W_TRUST = 0.25
@@ -50,18 +58,15 @@ class TreeProjectBuilder(ProjectBuilder):
         W_PLAUSIBILITY = 0.30
 
         # ── Trust-level scale ────────────────────────────────────────────────
-        TRUST_MID = 50   # TL at which Tₙ = 0.5 (user considered trustworthy from here)
-        TRUST_MAX = 100  # TL at which Tₙ = 1.0
+        TRUST_MID = 50
+        TRUST_MAX = 100
 
         rules: list[ScoringRule] = [
-            HeightFactorRule(
-                weight=W_HEIGHT,
-                h_max=72.0,              # maximum plausible tree height (m)
-            ),
+            HeightFactorRule(weight=W_HEIGHT, h_max=72.0),
             DistanceFactorRule(
                 weight=W_DISTANCE,
-                measured_score=1.0,      # full score when step length was physically measured
-                estimated_score=0.4,     # reduced score when step length was estimated
+                measured_score=1.0,
+                estimated_score=0.4,
             ),
             TrustLevelRule(
                 weight=W_TRUST,
@@ -70,8 +75,8 @@ class TreeProjectBuilder(ProjectBuilder):
             ),
             CommentFactorRule(
                 weight=W_COMMENT,
-                measurement_penalty=0.6,      # penalty when a measurement note is present
-                photo_penalty_per_photo=0.2,  # penalty per photo note present
+                measurement_penalty=0.6,
+                photo_penalty_per_photo=0.2,
             ),
             PlausibilityFactorRule(
                 weight=W_PLAUSIBILITY,
@@ -82,7 +87,7 @@ class TreeProjectBuilder(ProjectBuilder):
         ]
 
         # ── Advisory thresholds for client-side routing ──────────────────────
-        thresholds = ThresholdConfig(auto_approve_min=80, manual_review_min=50)
+        thresholds = ThresholdConfig(auto_approve_min=80, manual_review_min=20)
 
         # ── Stage 4-output: Trust Advisor ────────────────────────────────────
         trust_advisor = TrustAdvisor(
@@ -96,36 +101,52 @@ class TreeProjectBuilder(ProjectBuilder):
             )
         )
 
-        # ── Governance tiers (sorted automatically, highest threshold first) ─
-        # Role-weights pattern: threshold_score is the minimum accumulated weight
-        # to finalise; role_weights maps role → per-vote weight contribution.
-        # Roles absent from role_weights (or with weight 0) are ineligible.
+        # ── Governance tiers ─────────────────────────────────────────────────
+        # Sprint 5: role_configs / default_config / blocked_roles model.
         #
-        # peer_review    : 1 citizen  OR  1 expert   (threshold_score=1)
-        # community_review: 2 citizens OR  1 expert  (threshold_score=2)
-        # expert_review  : 1 expert only             (citizen weight=0 → ineligible)
+        # Tier semantics (illustrative examples per Rule 2 — not hardcoded):
+        #   peer_review:     score >= 80 — 1 vote from any eligible reviewer
+        #   community_review: score >= 50 — 2 citizen votes OR 1 expert vote
+        #   expert_review:   score  < 50 — only experts with high trust
+        #
+        # blocked_roles prevents 'guest' and 'banned' users from voting in any tier.
+
+        # Shared blocked roles for all tiers
+        BLOCKED = ["guest", "banned"]
+
         governance_policy = TreeGovernancePolicy(
             tiers=[
                 GovernanceTier(
                     score_threshold=80.0,
                     review_tier="peer_review",
                     threshold_score=1,
-                    role_weights={"citizen": 1, "expert": 1},
-                    required_min_trust=30,
+                    role_configs={
+                        "expert": RoleConfig(weight=1, min_trust=0),
+                        "citizen": RoleConfig(weight=1, min_trust=30),
+                    },
+                    default_config=RoleConfig(weight=1, min_trust=30),
+                    blocked_roles=BLOCKED,
                 ),
                 GovernanceTier(
                     score_threshold=50.0,
                     review_tier="community_review",
                     threshold_score=2,
-                    role_weights={"citizen": 1, "expert": 2},
-                    required_min_trust=50,
+                    role_configs={
+                        "expert": RoleConfig(weight=2, min_trust=0),
+                        "citizen": RoleConfig(weight=1, min_trust=50),
+                    },
+                    default_config=RoleConfig(weight=1, min_trust=50),
+                    blocked_roles=BLOCKED,
                 ),
                 GovernanceTier(
                     score_threshold=0.0,
                     review_tier="expert_review",
                     threshold_score=3,
-                    role_weights={"expert": 3},
-                    required_min_trust=75,
+                    role_configs={
+                        "expert": RoleConfig(weight=3, min_trust=75),
+                    },
+                    default_config=RoleConfig(weight=0, min_trust=9999),
+                    blocked_roles=BLOCKED,
                 ),
             ]
         )
@@ -136,4 +157,6 @@ class TreeProjectBuilder(ProjectBuilder):
             thresholds=thresholds,
             trust_advisor=trust_advisor,
             governance_policy=governance_policy,
+            valid_entity_types=["tree_measurement"],
+            webhook_url="http://localhost:8080/api/winnow/webhook",
         )

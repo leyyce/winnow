@@ -83,3 +83,39 @@ class NotEligibleError(WinnowError):
     def __init__(self, reason: str) -> None:
         self.reason = reason
         super().__init__(f"Reviewer is not eligible: {reason}")
+
+
+class InvalidEntityTypeError(WinnowError):
+    """
+    Raised when the envelope's entity_type is not in the project's valid_entity_types.
+
+    Mapped to HTTP 422 Unprocessable Entity at the API layer so the client
+    receives a clear, field-level validation error.
+    """
+
+    def __init__(self, entity_type: str, project_id: str, valid_types: list[str]) -> None:
+        self.entity_type = entity_type
+        self.project_id = project_id
+        self.valid_types = valid_types
+        super().__init__(
+            f"Entity type '{entity_type}' is not valid for project '{project_id}'. "
+            f"Accepted types: {valid_types}."
+        )
+
+
+class ConflictError(WinnowError):
+    """
+    Raised when a new submission targets a triplet whose latest scoring result
+    is already in a terminal state (approved / rejected / voided / superseded).
+
+    Preserves audit integrity — finalized measurements may not be overwritten.
+    Mapped to HTTP 409 Conflict at the API layer.
+    """
+
+    def __init__(self, submission_id: object, current_status: str) -> None:
+        self.submission_id = submission_id
+        self.current_status = current_status
+        super().__init__(
+            f"Cannot supersede submission '{submission_id}': it is already in "
+            f"terminal state '{current_status}'. Submit a new measurement instead."
+        )

@@ -28,7 +28,9 @@ def _metadata(**overrides) -> dict:
     base = dict(
         project_id="tree-app",
         submission_id=uuid4(),
-        submission_type="tree_measurement",
+        entity_type="tree_measurement",
+        entity_id=uuid4(),
+        measurement_id=uuid4(),
         submitted_at=_NOW,
     )
     base.update(overrides)
@@ -57,8 +59,9 @@ def _thresholds(**overrides) -> dict:
 def _required_validations(**overrides) -> dict:
     base = dict(
         threshold_score=2,
-        role_weights={"citizen": 1, "expert": 2},
-        required_min_trust=10,
+        role_configs={"citizen": {"weight": 1, "min_trust": 10}, "expert": {"weight": 2, "min_trust": 0}},
+        default_config={"weight": 1, "min_trust": 25},
+        blocked_roles=["guest", "banned"],
         review_tier="peer_review",
     )
     base.update(overrides)
@@ -81,9 +84,9 @@ class TestSubmissionMetadata:
         with pytest.raises(ValidationError, match="project_id"):
             SubmissionMetadata.model_validate(_metadata(project_id=""))
 
-    def test_empty_submission_type_rejected(self):
-        with pytest.raises(ValidationError, match="submission_type"):
-            SubmissionMetadata.model_validate(_metadata(submission_type=""))
+    def test_empty_entity_type_rejected(self):
+        with pytest.raises(ValidationError, match="entity_type"):
+            SubmissionMetadata.model_validate(_metadata(entity_type=""))
 
     def test_missing_submission_id_rejected(self):
         data = _metadata()
@@ -287,24 +290,28 @@ class TestRequiredValidations:
     def test_valid_construction(self):
         rv = RequiredValidations.model_validate(_required_validations())
         assert rv.threshold_score == 2
-        assert rv.role_weights == {"citizen": 1, "expert": 2}
-        assert rv.required_min_trust == 10
         assert rv.review_tier == "peer_review"
+        assert "citizen" in rv.role_configs
+        assert "expert" in rv.role_configs
+        assert rv.default_config.weight == 1
+        assert rv.default_config.min_trust == 25
+        assert rv.blocked_roles == ["guest", "banned"]
 
-    def test_role_weights_expert_only(self):
-        # Expert-only tier: citizen absent → weight 0 → ineligible by convention
+    def test_role_configs_expert_only(self):
+        # Expert-only tier: only expert in role_configs
         rv = RequiredValidations.model_validate(
-            _required_validations(role_weights={"expert": 3})
+            _required_validations(role_configs={"expert": {"weight": 3, "min_trust": 0}})
         )
-        assert rv.role_weights == {"expert": 3}
-        assert rv.role_weights.get("citizen", 0) == 0
+        assert "expert" in rv.role_configs
+        assert "citizen" not in rv.role_configs
+        assert rv.role_configs["expert"].weight == 3
 
-    def test_role_weights_empty_dict_accepted(self):
-        # An empty role_weights means no role is eligible — unusual but schema-valid
+    def test_role_configs_empty_dict_accepted(self):
+        # Empty role_configs — all roles fall back to default_config
         rv = RequiredValidations.model_validate(
-            _required_validations(role_weights={})
+            _required_validations(role_configs={})
         )
-        assert rv.role_weights == {}
+        assert rv.role_configs == {}
 
     def test_threshold_score_zero_rejected(self):
         with pytest.raises(ValidationError, match="threshold_score"):
@@ -315,36 +322,40 @@ class TestRequiredValidations:
             RequiredValidations.model_validate(_required_validations(threshold_score=-1))
 
     def test_threshold_score_one_accepted(self):
-        # Boundary: threshold_score=1 is the minimum valid value
         rv = RequiredValidations.model_validate(_required_validations(threshold_score=1))
         assert rv.threshold_score == 1
 
-    def test_required_min_trust_zero_allowed(self):
-        rv = RequiredValidations.model_validate(_required_validations(required_min_trust=0))
-        assert rv.required_min_trust == 0
+    def test_default_config_min_trust_zero_allowed(self):
+        rv = RequiredValidations.model_validate(
+            _required_validations(default_config={"weight": 1, "min_trust": 0})
+        )
+        assert rv.default_config.min_trust == 0
 
-    def test_required_min_trust_negative_rejected(self):
-        with pytest.raises(ValidationError, match="required_min_trust"):
-            RequiredValidations.model_validate(_required_validations(required_min_trust=-1))
+    def test_default_config_negative_min_trust_rejected(self):
+        with pytest.raises(ValidationError, match="min_trust"):
+            RequiredValidations.model_validate(
+                _required_validations(default_config={"weight": 1, "min_trust": -1})
+            )
 
     def test_empty_review_tier_rejected(self):
         with pytest.raises(ValidationError, match="review_tier"):
             RequiredValidations.model_validate(_required_validations(review_tier=""))
 
     def test_large_trust_accepted(self):
-        # Trust scale is project-specific — no le= upper bound
-        rv = RequiredValidations.model_validate(_required_validations(required_min_trust=500))
-        assert rv.required_min_trust == 500
+        rv = RequiredValidations.model_validate(
+            _required_validations(default_config={"weight": 1, "min_trust": 500})
+        )
+        assert rv.default_config.min_trust == 500
 
     def test_old_min_validators_field_does_not_exist(self):
-        # Ensure the old field name is gone — callers must use threshold_score
         rv = RequiredValidations.model_validate(_required_validations())
         assert not hasattr(rv, "min_validators")
 
     def test_old_required_role_field_does_not_exist(self):
-        # Ensure the old field name is gone — role constraints live in role_weights
         rv = RequiredValidations.model_validate(_required_validations())
         assert not hasattr(rv, "required_role")
+        assert not hasattr(rv, "role_weights")
+        assert not hasattr(rv, "required_min_trust")
 
 
 # ── ScoringResultResponse ──────────────────────────────────────────────────────
@@ -354,19 +365,24 @@ class TestScoringResultResponse:
         base = dict(
             submission_id=uuid4(),
             project_id="tree-app",
-            status="pending_finalization",
+            entity_type="tree_measurement",
+            entity_id=uuid4(),
+            measurement_id=uuid4(),
+            status="pending_review",
             confidence_score=72.5,
             breakdown=[],
             required_validations=_required_validations(),
             thresholds=_thresholds(),
+            current_user_vote=None,
+            ledger_entry_id=uuid4(),
             created_at=_NOW,
         )
         base.update(overrides)
         return base
 
-    def test_valid_pending_finalization(self):
+    def test_valid_pending_review(self):
         resp = ScoringResultResponse.model_validate(self._make())
-        assert resp.status == "pending_finalization"
+        assert resp.status == "pending_review"
 
     def test_valid_approved_status(self):
         resp = ScoringResultResponse.model_validate(self._make(status="approved"))

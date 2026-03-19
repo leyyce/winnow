@@ -60,6 +60,17 @@ class ProjectRegistryEntry:
     thresholds: ThresholdConfig          # advisory score thresholds for client routing
     trust_advisor: TrustAdvisor          # Stage 4-output trust adjustment advisor
     governance_policy: GovernancePolicy  # review tiers + reviewer eligibility
+    # Allowlist of entity_type values accepted for this project (Rule 3 — no magic strings)
+    valid_entity_types: list[str] = None  # type: ignore[assignment]
+    # Webhook delivery URL — Winnow POSTs every status_ledger event here (Rule 11)
+    webhook_url: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.valid_entity_types is None:
+            raise ValueError(
+                f"ProjectRegistryEntry requires 'valid_entity_types' to be set. "
+                "Define the accepted entity types in the ProjectBuilder."
+            )
 
 
 class Registry:

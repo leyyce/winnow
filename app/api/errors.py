@@ -20,7 +20,9 @@ from pydantic import ValidationError
 from app.core.config import settings
 from app.core.exceptions import (
     AlreadyFinalizedError,
+    ConflictError,
     DuplicateVoteError,
+    InvalidEntityTypeError,
     NotEligibleError,
     NotImplementedYetError,
     ProjectNotFoundError,
@@ -169,6 +171,47 @@ def register_exception_handlers(app: FastAPI) -> None:
         problem = ProblemDetail(
             type=_type_uri("already-finalized"),
             title="Already Finalized",
+            status=409,
+            detail=str(exc),
+            instance=str(request.url.path),
+        )
+        return _problem_response(problem)
+
+    @app.exception_handler(InvalidEntityTypeError)
+    async def _handle_invalid_entity_type(
+        request: Request,
+        exc: InvalidEntityTypeError,
+    ) -> JSONResponse:
+        """422 — entity_type not in the project's valid_entity_types allowlist."""
+        problem = ProblemDetail(
+            type=_type_uri("invalid-entity-type"),
+            title="Invalid Entity Type",
+            status=422,
+            detail=str(exc),
+            instance=str(request.url.path),
+            errors=[
+                FieldError(
+                    field="metadata.entity_type",
+                    message=(
+                        f"'{exc.entity_type}' is not a recognised entity type "
+                        f"for project '{exc.project_id}'. "
+                        f"Valid types: {exc.valid_types}"
+                    ),
+                    type="invalid_entity_type",
+                )
+            ],
+        )
+        return _problem_response(problem)
+
+    @app.exception_handler(ConflictError)
+    async def _handle_conflict(
+        request: Request,
+        exc: ConflictError,
+    ) -> JSONResponse:
+        """409 — new submission conflicts with a terminal-state prior submission."""
+        problem = ProblemDetail(
+            type=_type_uri("submission-conflict"),
+            title="Submission Conflict",
             status=409,
             detail=str(exc),
             instance=str(request.url.path),

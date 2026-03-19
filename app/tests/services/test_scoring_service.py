@@ -46,7 +46,9 @@ def _envelope(
         metadata=SubmissionMetadata(
             project_id=project_id,
             submission_id=uuid4(),
-            submission_type="tree_measurement",
+            entity_type="tree_measurement",
+            entity_id=uuid4(),
+            measurement_id=uuid4(),
             submitted_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
         ),
         user_context=_ctx(trust_level=trust_level),
@@ -99,17 +101,18 @@ async def test_process_submission_breakdown_non_empty(
 async def test_process_submission_required_validations_new_schema(
     db_session: AsyncSession,
 ) -> None:
-    """required_validations must expose threshold_score and role_weights (new role-weights pattern)."""
+    """required_validations must expose Sprint 5 role_configs/default_config/blocked_roles."""
     result = await process_submission(_envelope(), db_session)
     rv = result.required_validations
     assert rv.threshold_score >= 1
-    assert isinstance(rv.role_weights, dict)
-    assert len(rv.role_weights) > 0
-    for role, weight in rv.role_weights.items():
+    assert isinstance(rv.role_configs, dict)
+    assert isinstance(rv.default_config.weight, int)
+    assert rv.default_config.min_trust >= 0
+    assert isinstance(rv.blocked_roles, list)
+    for role, cfg in rv.role_configs.items():
         assert isinstance(role, str)
-        assert isinstance(weight, int)
-        assert weight >= 0
-    assert rv.required_min_trust >= 0
+        assert cfg.weight >= 0
+        assert cfg.min_trust >= 0
     assert isinstance(rv.review_tier, str) and len(rv.review_tier) > 0
 
 
@@ -221,12 +224,12 @@ async def test_process_submission_empty_payload_raises_validation_error(
         await process_submission(envelope, db_session)
 
 
-async def test_process_submission_missing_tree_id_raises_validation_error(
+async def test_process_submission_missing_species_id_raises_validation_error(
     db_session: AsyncSession,
 ) -> None:
-    """Payload missing required tree_id must fail Stage 1."""
+    """Payload missing required species_id must fail Stage 1 validation."""
     payload = _payload().model_dump(mode="json")
-    del payload["tree_id"]
+    del payload["species_id"]
     envelope = _envelope(payload=payload)
     with pytest.raises(ValidationError):
         await process_submission(envelope, db_session)

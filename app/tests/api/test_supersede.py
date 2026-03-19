@@ -1,24 +1,16 @@
 """
-API integration tests for the Winnow supersede endpoint.
+API integration tests for withdraw, override, and auto-supersede lifecycle.
 
-Covered endpoint
-----------------
-* PATCH /api/v1/submissions/{id}/supersede
-
-Tests verify
-------------
-- Happy path: existing pending_review submission → 200 SupersedeResponse
-- Unknown submission_id → 404 RFC 7807
-- Already-finalized submission → 409 RFC 7807
-- Schema enforcement: ONLY ``status="superseded"`` accepted
-- ``superseded_by`` is a required UUID field
-- Missing or malformed fields produce RFC 7807 422 responses with field names
-- The old PATCH /final-status route is no longer registered
+Covered endpoints
+-----------------
+* PATCH /api/v1/submissions/{id}/withdraw  — user-initiated withdrawal
+* PATCH /api/v1/submissions/{id}/override  — admin override (power-vote)
+* POST  /api/v1/submissions                — auto-supersede + 409 conflict
 
 References
 ----------
-* API contract: docs/architecture/03_api_contracts.md §3b
-* Sprint 3:     supersede is now fully DB-backed (no longer a 501 stub)
+* API contract: docs/architecture/03_api_contracts.md §3
+* Issue:        Refinement Sprint — Immutable Audit-Log & Governance Authority
 """
 from __future__ import annotations
 
@@ -33,15 +25,23 @@ from app.tests.conftest import _ctx, _payload
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _valid_envelope(project_id: str = "tree-app") -> dict:
-    """Return a serialisable dict representing a valid SubmissionEnvelope."""
-    ctx = _ctx(trust_level=50)
-    payload = _payload()
+def _valid_envelope(
+    *,
+    project_id: str = "tree-app",
+    entity_id: str | None = None,
+    measurement_id: str | None = None,
+    submission_id: str | None = None,
+    trust_level: int = 50,
+) -> dict:
+    """Return a valid SubmissionEnvelope dict with configurable identity triplet."""
+    ctx = _ctx(trust_level=trust_level)
     return {
         "metadata": {
             "project_id": project_id,
-            "submission_id": str(uuid4()),
-            "submission_type": "tree_measurement",
+            "submission_id": submission_id or str(uuid4()),
+            "entity_type": "tree_measurement",
+            "entity_id": entity_id or str(uuid4()),
+            "measurement_id": measurement_id or str(uuid4()),
             "submitted_at": datetime(2024, 1, 1, tzinfo=timezone.utc).isoformat(),
         },
         "user_context": {
@@ -52,245 +52,264 @@ def _valid_envelope(project_id: str = "tree-app") -> dict:
             "total_submissions": ctx.total_submissions,
             "account_created_at": ctx.account_created_at.isoformat(),
         },
-        "payload": payload.model_dump(mode="json"),
+        "payload": _payload().model_dump(mode="json"),
     }
 
 
-def _supersede_body(
-    *,
-    status: str = "superseded",
-    superseded_by: str | None = None,
-) -> dict:
-    """Return a serialisable dict representing a valid SupersedeRequest."""
-    body: dict = {"status": status}
-    body["superseded_by"] = superseded_by or str(uuid4())
-    return body
+async def _submit(client: AsyncClient, **kwargs) -> dict:
+    """Submit an envelope and return the parsed response body (asserts 201)."""
+    response = await client.post("/api/v1/submissions", json=_valid_envelope(**kwargs))
+    assert response.status_code == 201, response.text
+    return response.json()
 
 
-async def _submit_and_get_id(client: AsyncClient) -> str:
-    """Submit a valid envelope and return the submission_id string."""
-    response = await client.post("/api/v1/submissions", json=_valid_envelope())
-    assert response.status_code == 201
-    return response.json()["submission_id"]
+# ── PATCH /submissions/{id}/withdraw ─────────────────────────────────────────
 
+async def test_withdraw_pending_returns_200(async_client: AsyncClient) -> None:
+    """Withdrawing a pending_review submission returns 200 with status 'voided'."""
+    body = await _submit(async_client)
+    sid = body["submission_id"]
 
-# ── Happy path — DB-backed (Sprint 3) ────────────────────────────────────────
+    # Only pending_review submissions can be withdrawn; skip if auto-approved/rejected
+    if body["status"] != "pending_review":
+        pytest.skip("Submission was auto-finalized by threshold — cannot test withdraw")
 
-async def test_supersede_valid_request_returns_200(async_client: AsyncClient) -> None:
-    """
-    Valid supersede on an existing ``pending_review`` submission → 200.
+    response = await async_client.patch(f"/api/v1/submissions/{sid}/withdraw")
 
-    Sprint 3: the endpoint is fully implemented against the DB.
-    The submission must exist first (POST /submissions), then PATCH supersede.
-    """
-    sid = await _submit_and_get_id(async_client)
-    replacement_id = str(uuid4())
-
-    response = await async_client.patch(
-        f"/api/v1/submissions/{sid}/supersede",
-        json=_supersede_body(superseded_by=replacement_id),
-    )
     assert response.status_code == 200
-    body = response.json()
-    assert body["status"] == "superseded"
-    assert body["submission_id"] == sid
-    assert body["superseded_by"] == replacement_id
-    assert "updated_at" in body
+    assert response.json()["status"] == "voided"
 
 
-async def test_supersede_response_shape(async_client: AsyncClient) -> None:
-    """200 response must contain all required SupersedeResponse fields."""
-    sid = await _submit_and_get_id(async_client)
-    response = await async_client.patch(
-        f"/api/v1/submissions/{sid}/supersede",
-        json=_supersede_body(),
-    )
-    body = response.json()
-    assert response.status_code == 200
-    assert "submission_id" in body
-    assert "status" in body
-    assert "superseded_by" in body
-    assert "updated_at" in body
+async def test_withdraw_unknown_submission_returns_404(async_client: AsyncClient) -> None:
+    """Withdrawing a non-existent submission UUID returns 404."""
+    response = await async_client.patch(f"/api/v1/submissions/{uuid4()}/withdraw")
 
-
-# ── 404 for unknown submission_id ─────────────────────────────────────────────
-
-async def test_supersede_unknown_id_returns_404(async_client: AsyncClient) -> None:
-    """
-    Supersede with an unknown ``submission_id`` → 404 RFC 7807 response.
-    The submission does not exist in DB so ``SubmissionNotFoundError`` is raised.
-    """
-    fake_id = str(uuid4())
-    response = await async_client.patch(
-        f"/api/v1/submissions/{fake_id}/supersede",
-        json=_supersede_body(),
-    )
     assert response.status_code == 404
 
 
-async def test_supersede_unknown_id_rfc7807_body(async_client: AsyncClient) -> None:
-    """404 body for unknown submission must be a well-formed RFC 7807 ProblemDetail."""
-    fake_id = str(uuid4())
-    response = await async_client.patch(
-        f"/api/v1/submissions/{fake_id}/supersede",
-        json=_supersede_body(),
-    )
+async def test_withdraw_already_voided_returns_409(async_client: AsyncClient) -> None:
+    """Withdrawing an already-voided submission returns 409 (AlreadyFinalized)."""
+    body = await _submit(async_client)
+    sid = body["submission_id"]
+
+    if body["status"] != "pending_review":
+        pytest.skip("Submission was auto-finalized — cannot test double-withdraw")
+
+    # First withdrawal succeeds
+    r1 = await async_client.patch(f"/api/v1/submissions/{sid}/withdraw")
+    assert r1.status_code == 200
+
+    # Second withdrawal must fail
+    r2 = await async_client.patch(f"/api/v1/submissions/{sid}/withdraw")
+    assert r2.status_code == 409
+
+
+async def test_withdraw_response_is_rfc7807_on_not_found(async_client: AsyncClient) -> None:
+    """404 on withdraw must be RFC 7807 ProblemDetail."""
+    response = await async_client.patch(f"/api/v1/submissions/{uuid4()}/withdraw")
+
     body = response.json()
-    assert body["type"].endswith("/errors/submission-not-found")
-    assert body["title"] == "Submission Not Found"
-    assert body["status"] == 404
-    assert "instance" in body
-    assert fake_id in body["detail"]
+    assert response.status_code == 404
+    assert "type" in body
+    assert "title" in body
+    assert "status" in body
 
 
-# ── 409 for already-finalized submission ──────────────────────────────────────
+# ── PATCH /submissions/{id}/override ─────────────────────────────────────────
 
-async def test_supersede_already_superseded_returns_409(
-    async_client: AsyncClient,
-) -> None:
-    """Superseding an already-superseded submission → 409 AlreadyFinalized."""
-    sid = await _submit_and_get_id(async_client)
-    # First supersede — succeeds
-    await async_client.patch(
-        f"/api/v1/submissions/{sid}/supersede",
-        json=_supersede_body(),
-    )
-    # Second supersede — must fail with 409
+async def test_override_approve_returns_200_approved(async_client: AsyncClient) -> None:
+    """Admin override with vote='approve' forces status to 'approved'."""
+    body = await _submit(async_client)
+    sid = body["submission_id"]
+
+    if body["status"] != "pending_review":
+        pytest.skip("Submission was auto-finalized — cannot test override")
+
+    override_request = {
+        "user_id": str(uuid4()),
+        "vote": "approve",
+        "is_override": True,
+        "user_trust_level": 99,
+        "user_role": "admin",
+    }
     response = await async_client.patch(
-        f"/api/v1/submissions/{sid}/supersede",
-        json=_supersede_body(),
+        f"/api/v1/submissions/{sid}/override", json=override_request
     )
-    assert response.status_code == 409
-    body = response.json()
-    assert body["type"].endswith("/errors/already-finalized")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "approved"
 
 
-# ── Schema enforcement: only "superseded" is accepted ────────────────────────
+async def test_override_reject_returns_200_rejected(async_client: AsyncClient) -> None:
+    """Admin override with vote='reject' forces status to 'rejected'."""
+    body = await _submit(async_client)
+    sid = body["submission_id"]
 
-async def test_supersede_status_approved_returns_422(async_client: AsyncClient) -> None:
+    if body["status"] != "pending_review":
+        pytest.skip("Submission was auto-finalized — cannot test override")
+
+    override_request = {
+        "user_id": str(uuid4()),
+        "vote": "reject",
+        "is_override": True,
+        "user_trust_level": 99,
+        "user_role": "admin",
+    }
+    response = await async_client.patch(
+        f"/api/v1/submissions/{sid}/override", json=override_request
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "rejected"
+
+
+async def test_override_unknown_submission_returns_404(async_client: AsyncClient) -> None:
+    """Override on a non-existent submission returns 404."""
+    override_request = {
+        "user_id": str(uuid4()),
+        "vote": "approve",
+        "is_override": True,
+        "user_trust_level": 99,
+        "user_role": "admin",
+    }
+    response = await async_client.patch(
+        f"/api/v1/submissions/{uuid4()}/override", json=override_request
+    )
+
+    assert response.status_code == 404
+
+
+async def test_override_already_finalized_returns_409(async_client: AsyncClient) -> None:
+    """Admin override on an already-finalized submission returns 409."""
+    body = await _submit(async_client)
+    sid = body["submission_id"]
+
+    if body["status"] != "pending_review":
+        pytest.skip("Submission was auto-finalized — cannot test double-override")
+
+    override_request = {
+        "user_id": str(uuid4()),
+        "vote": "approve",
+        "is_override": True,
+        "user_trust_level": 99,
+        "user_role": "admin",
+    }
+    # First override succeeds
+    r1 = await async_client.patch(
+        f"/api/v1/submissions/{sid}/override", json=override_request
+    )
+    assert r1.status_code == 200
+
+    # Second override must fail — already finalized
+    r2 = await async_client.patch(
+        f"/api/v1/submissions/{sid}/override", json=override_request
+    )
+    assert r2.status_code == 409
+
+
+# ── Auto-supersede via POST /submissions ─────────────────────────────────────
+
+async def test_auto_supersede_pending_submission(async_client: AsyncClient) -> None:
     """
-    ``status="approved"`` must be rejected with 422.
-    Approved/rejected transitions are governed by the vote-threshold engine.
+    Submitting a new envelope for the same (project, entity, measurement)
+    triplet auto-supersedes the prior pending_review submission.
     """
-    fake_id = str(uuid4())
-    response = await async_client.patch(
-        f"/api/v1/submissions/{fake_id}/supersede",
-        json=_supersede_body(status="approved"),
+    shared_entity_id = str(uuid4())
+    shared_measurement_id = str(uuid4())
+
+    first = await _submit(
+        async_client,
+        entity_id=shared_entity_id,
+        measurement_id=shared_measurement_id,
     )
-    assert response.status_code == 422
+    if first["status"] != "pending_review":
+        pytest.skip("First submission was auto-finalized — cannot test auto-supersede")
 
+    first_sid = first["submission_id"]
 
-async def test_supersede_status_rejected_returns_422(async_client: AsyncClient) -> None:
-    """``status="rejected"`` must be rejected with 422 for the same reason."""
-    fake_id = str(uuid4())
-    response = await async_client.patch(
-        f"/api/v1/submissions/{fake_id}/supersede",
-        json=_supersede_body(status="rejected"),
+    # Same triplet — should auto-supersede the first
+    second_response = await async_client.post(
+        "/api/v1/submissions",
+        json=_valid_envelope(
+            entity_id=shared_entity_id,
+            measurement_id=shared_measurement_id,
+        ),
     )
-    assert response.status_code == 422
+    assert second_response.status_code == 201
+
+    # Sprint 5: old chain is NEVER modified — it stays pending_review.
+    # Supersession is tracked by the new chain's backward pointer (supersedes FK).
+    get_first = await async_client.get(f"/api/v1/results/{first_sid}")
+    assert get_first.status_code == 200
+    assert get_first.json()["status"] == "pending_review"
+
+    # New submission carries supersede_reason='edited' confirming the cross-chain link
+    second_body = second_response.json()
+    assert second_body["supersede_reason"] == "edited"
 
 
-async def test_supersede_status_pending_review_returns_422(
-    async_client: AsyncClient,
-) -> None:
-    """No lifecycle status other than 'superseded' is valid on this endpoint."""
-    fake_id = str(uuid4())
-    response = await async_client.patch(
-        f"/api/v1/submissions/{fake_id}/supersede",
-        json=_supersede_body(status="pending_review"),
-    )
-    assert response.status_code == 422
-
-
-async def test_supersede_invalid_status_mentions_field_in_errors(
-    async_client: AsyncClient,
-) -> None:
-    """422 for wrong status value must name 'status' in the RFC 7807 errors list."""
-    fake_id = str(uuid4())
-    response = await async_client.patch(
-        f"/api/v1/submissions/{fake_id}/supersede",
-        json=_supersede_body(status="approved"),
-    )
-    body = response.json()
-    assert response.status_code == 422
-    fields = [e["field"] for e in body.get("errors", [])]
-    assert any("status" in f for f in fields)
-
-
-# ── Missing / malformed fields ────────────────────────────────────────────────
-
-async def test_supersede_missing_superseded_by_returns_422(
-    async_client: AsyncClient,
-) -> None:
-    """``superseded_by`` is required — omitting it must return 422."""
-    fake_id = str(uuid4())
-    response = await async_client.patch(
-        f"/api/v1/submissions/{fake_id}/supersede",
-        json={"status": "superseded"},
-    )
-    assert response.status_code == 422
-
-
-async def test_supersede_missing_superseded_by_mentions_field(
-    async_client: AsyncClient,
-) -> None:
-    """422 for missing superseded_by must name that field in the RFC 7807 errors."""
-    fake_id = str(uuid4())
-    response = await async_client.patch(
-        f"/api/v1/submissions/{fake_id}/supersede",
-        json={"status": "superseded"},
-    )
-    body = response.json()
-    assert response.status_code == 422
-    fields = [e["field"] for e in body.get("errors", [])]
-    assert any("superseded_by" in f for f in fields)
-
-
-async def test_supersede_invalid_uuid_for_superseded_by_returns_422(
-    async_client: AsyncClient,
-) -> None:
-    """A non-UUID string for ``superseded_by`` must fail Pydantic UUID validation."""
-    fake_id = str(uuid4())
-    response = await async_client.patch(
-        f"/api/v1/submissions/{fake_id}/supersede",
-        json=_supersede_body(superseded_by="not-a-uuid"),
-    )
-    assert response.status_code == 422
-
-
-async def test_supersede_invalid_uuid_mentions_field(async_client: AsyncClient) -> None:
-    """422 for invalid superseded_by UUID must name that field in errors."""
-    fake_id = str(uuid4())
-    response = await async_client.patch(
-        f"/api/v1/submissions/{fake_id}/supersede",
-        json=_supersede_body(superseded_by="not-a-uuid"),
-    )
-    body = response.json()
-    assert response.status_code == 422
-    fields = [e["field"] for e in body.get("errors", [])]
-    assert any("superseded_by" in f for f in fields)
-
-
-async def test_supersede_empty_body_returns_422(async_client: AsyncClient) -> None:
-    """Completely empty body must fail validation with 422."""
-    fake_id = str(uuid4())
-    response = await async_client.patch(
-        f"/api/v1/submissions/{fake_id}/supersede",
-        json={},
-    )
-    assert response.status_code == 422
-
-
-# ── Old route is gone ─────────────────────────────────────────────────────────
-
-async def test_old_final_status_route_returns_404(async_client: AsyncClient) -> None:
+async def test_auto_supersede_terminal_returns_409(async_client: AsyncClient) -> None:
     """
-    The old PATCH /submissions/{id}/final-status endpoint must no longer exist.
-    Replaced by PATCH /submissions/{id}/supersede + vote-threshold auto-finalization.
+    Submitting for the same triplet when the prior submission is already in a
+    terminal state must return 409 Conflict.
     """
-    fake_id = str(uuid4())
+    shared_entity_id = str(uuid4())
+    shared_measurement_id = str(uuid4())
+
+    first = await _submit(
+        async_client,
+        entity_id=shared_entity_id,
+        measurement_id=shared_measurement_id,
+    )
+    first_sid = first["submission_id"]
+
+    if first["status"] != "pending_review":
+        pytest.skip("First submission was auto-finalized — cannot test 409 via override")
+
+    # Force terminal state via admin override
+    override_request = {
+        "user_id": str(uuid4()),
+        "vote": "approve",
+        "is_override": True,
+        "user_trust_level": 99,
+        "user_role": "admin",
+    }
+    r = await async_client.patch(
+        f"/api/v1/submissions/{first_sid}/override", json=override_request
+    )
+    assert r.status_code == 200
+
+    # Now a new submission for the same triplet must return 409
+    conflict_response = await async_client.post(
+        "/api/v1/submissions",
+        json=_valid_envelope(
+            entity_id=shared_entity_id,
+            measurement_id=shared_measurement_id,
+        ),
+    )
+    assert conflict_response.status_code == 409
+    body = conflict_response.json()
+    assert "type" in body
+    assert body["status"] == 409
+
+
+async def test_invalid_entity_type_returns_422_with_field(async_client: AsyncClient) -> None:
+    """Unknown entity_type must return 422 with the failing field in RFC 7807 errors."""
+    envelope = _valid_envelope()
+    envelope["metadata"]["entity_type"] = "unknown_entity"
+
+    response = await async_client.post("/api/v1/submissions", json=envelope)
+
+    assert response.status_code == 422
+    body = response.json()
+    assert "errors" in body
+    assert any("entity_type" in e["field"] for e in body["errors"])
+
+
+async def test_old_supersede_route_returns_404(async_client: AsyncClient) -> None:
+    """The old PATCH /supersede route must no longer exist (404)."""
     response = await async_client.patch(
-        f"/api/v1/submissions/{fake_id}/final-status",
-        json={"final_status": "approved"},
+        f"/api/v1/submissions/{uuid4()}/supersede",
+        json={"status": "superseded", "superseded_by": str(uuid4())},
     )
     assert response.status_code == 404

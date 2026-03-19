@@ -82,13 +82,14 @@ class TreePayload(BaseModel):
 
     Stage 1 validation enforces structural correctness and physical feasibility
     only. Statistical plausibility (Pₙ) is evaluated during Stage 2 scoring.
+
+    Note: ``tree_id`` (entity identity) has been removed from this payload.
+    It is now carried as ``entity_id`` in ``SubmissionMetadata``, which is the
+    canonical first-class location for all identity-triplet fields.
     """
 
     model_config = ConfigDict(frozen=True)
 
-    tree_id: UUID = Field(
-        description="UUID of the tree entity in the client system.",
-    )
     species_id: UUID = Field(
         description="UUID of the tree species in the client system.",
     )
