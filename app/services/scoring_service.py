@@ -63,7 +63,8 @@ from app.models.submission_user_snapshot import SubmissionUserSnapshot
 from app.models.submission_vote import SubmissionVote
 from app.registry.manager import registry
 from app.schemas.envelope import SubmissionEnvelope
-from app.schemas.results import RuleBreakdown, ScoringResultResponse
+from app.schemas.results import RequiredValidations, RuleBreakdown, ScoringResultResponse
+from app.schemas.voting import ActiveVoteItem
 from app.services import webhook_service
 
 logger = logging.getLogger(__name__)
@@ -246,25 +247,51 @@ async def _count_active_submissions(
     return result.scalar() or 0
 
 
-async def _get_current_user_vote(
+async def _get_active_votes(
     submission_id: UUID,
-    user_id: UUID | None,
     db: AsyncSession,
-) -> str | None:
-    """Return the requesting user's latest vote value, or None."""
-    if user_id is None:
-        return None
-    stmt = (
-        select(SubmissionVote.vote)
-        .where(
-            SubmissionVote.submission_id == submission_id,
-            SubmissionVote.user_id == user_id,
+) -> list[ActiveVoteItem]:
+    """
+    Return the latest-wins resolved vote list for all reviewers on a submission.
+
+    Uses a subquery to select the most recent ``created_at`` per user, then
+    joins back to get the full row — identical to the VotingService tally
+    helper but returns ``ActiveVoteItem`` schema objects for API responses.
+    """
+    from datetime import timezone
+
+    max_per_user = (
+        select(
+            SubmissionVote.user_id,
+            func.max(SubmissionVote.created_at).label("max_created"),
         )
-        .order_by(SubmissionVote.created_at.desc())
-        .limit(1)
+        .where(SubmissionVote.submission_id == submission_id)
+        .group_by(SubmissionVote.user_id)
+        .subquery()
     )
-    result = await db.execute(stmt)
-    return result.scalar_one_or_none()
+    stmt = select(SubmissionVote).join(
+        max_per_user,
+        (SubmissionVote.user_id == max_per_user.c.user_id)
+        & (SubmissionVote.created_at == max_per_user.c.max_created)
+        & (SubmissionVote.submission_id == submission_id),
+    )
+    rows = (await db.execute(stmt)).scalars().all()
+    items = []
+    for v in rows:
+        created = v.created_at
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        items.append(
+            ActiveVoteItem(
+                user_id=v.user_id,
+                user_role=v.user_role,
+                vote=v.vote,
+                is_override=v.is_override,
+                note=v.note,
+                created_at=created,
+            )
+        )
+    return items
 
 
 async def _enqueue_webhook(
@@ -299,17 +326,16 @@ def _build_response(
     submission: Submission,
     snapshot: ScoringSnapshot,
     ledger_entry: StatusLedger,
-    current_user_vote: str | None = None,
+    active_votes: list[ActiveVoteItem] | None = None,
 ) -> ScoringResultResponse:
     """Assemble a ScoringResultResponse from ORM objects."""
-    from app.schemas.results import (
-        RequiredValidations,
-        RoleConfig,
-        ThresholdConfig,
-    )
+    from app.schemas.results import ThresholdConfig
 
     breakdown = [RuleBreakdown.model_validate(r) for r in snapshot.breakdown]
-    required = RequiredValidations.model_validate(snapshot.required_validations)
+    # required_validations is stored as a JSON array of tier dicts
+    required_list = [
+        RequiredValidations.model_validate(r) for r in snapshot.required_validations
+    ]
     thresholds = ThresholdConfig.model_validate(snapshot.thresholds)
 
     return ScoringResultResponse(
@@ -323,9 +349,9 @@ def _build_response(
         trust_delta=ledger_entry.trust_delta,
         confidence_score=snapshot.confidence_score,
         breakdown=breakdown,
-        required_validations=required,
+        required_validations=required_list,
         thresholds=thresholds,
-        current_user_vote=current_user_vote,
+        active_votes=active_votes or [],
         ledger_entry_id=ledger_entry.id,
         created_at=_ensure_tz(submission.created_at),
     )
@@ -382,12 +408,10 @@ async def process_submission(
     if existing is not None:
         snapshot = await _latest_scoring_snapshot(submission_id, db)
         ledger = await _latest_ledger_entry(submission_id, db)
-        current_vote = await _get_current_user_vote(
-            submission_id, requesting_user_id or user_ctx.user_id, db
-        )
+        active_votes = await _get_active_votes(submission_id, db)
         logger.info("Idempotent re-submission — returning stored result",
                     extra={"submission_id": str(submission_id)})
-        return _build_response(existing, snapshot, ledger, current_vote)
+        return _build_response(existing, snapshot, ledger, active_votes)
 
     # Step 3 — Stage 1: validate payload
     validated_payload = config.payload_schema.model_validate(envelope.payload)
@@ -484,7 +508,7 @@ async def process_submission(
         submission_id=submission_id,
         confidence_score=pipeline_result.total_score,
         breakdown=[r.model_dump(mode="json") for r in breakdown],
-        required_validations=required.model_dump(mode="json"),
+        required_validations=[r.model_dump(mode="json") for r in required],
         thresholds=thresholds.model_dump(mode="json"),
     )
     db.add(snapshot)
@@ -598,6 +622,6 @@ async def get_submission_result(
 
     snapshot = await _latest_scoring_snapshot(submission_id, db)
     ledger = await _latest_ledger_entry(submission_id, db)
-    current_vote = await _get_current_user_vote(submission_id, requesting_user_id, db)
+    active_votes = await _get_active_votes(submission_id, db)
 
-    return _build_response(submission, snapshot, ledger, current_vote)
+    return _build_response(submission, snapshot, ledger, active_votes)

@@ -22,7 +22,7 @@ References
 """
 from __future__ import annotations
 
-from app.governance.projects.trees import GovernanceTier, TreeGovernancePolicy
+from app.governance.base import GovernanceTier, GovernancePolicy
 from app.registry.base import ProjectBuilder
 from app.registry.manager import ProjectRegistryEntry
 from app.schemas.projects.trees import TreePayload
@@ -114,7 +114,7 @@ class TreeProjectBuilder(ProjectBuilder):
         # Shared blocked roles for all tiers
         BLOCKED = ["guest", "banned"]
 
-        governance_policy = TreeGovernancePolicy(
+        governance_policy = GovernancePolicy(
             tiers=[
                 GovernanceTier(
                     score_threshold=80.0,

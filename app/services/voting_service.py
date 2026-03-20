@@ -170,25 +170,43 @@ async def cast_vote(
 
     # Step 2 — lock latest ledger entry (FOR UPDATE)
     current_ledger = await _latest_ledger_entry(submission_id, db, for_update=True)
-    if current_ledger is None or current_ledger.status != StatusLedgerStatus.PENDING_REVIEW:
-        status = getattr(current_ledger, "status", "unknown")
-        raise AlreadyFinalizedError(submission_id, status)
+    # Admin overrides may target any status (including terminal states).
+    # Normal votes are only permitted when the submission is pending_review.
+    if not request.is_override:
+        if current_ledger is None or current_ledger.status != StatusLedgerStatus.PENDING_REVIEW:
+            status = getattr(current_ledger, "status", "unknown")
+            raise AlreadyFinalizedError(submission_id, status)
 
     # Load latest scoring snapshot for governance snapshot
     snapshot = await _latest_scoring_snapshot(submission_id, db)
-    requirements = RequiredValidations.model_validate(snapshot.required_validations)
+    # required_validations is stored as a JSON array of tier dicts
+    all_requirements: list[RequiredValidations] = [
+        RequiredValidations.model_validate(r) for r in snapshot.required_validations
+    ]
 
     config = registry.get_config(submission.project_id)
     governance_policy = config.governance_policy
 
     # Step 3–4 — eligibility check (skipped for admin override)
+    # Reviewer is eligible if they qualify in at least one applicable tier.
     if not request.is_override:
-        # Raises NotEligibleError if ineligible — propagates to API layer (Rule 9)
-        governance_policy.get_vote_weight(
-            requirements,
-            request.user_role,
-            request.user_trust_level,
-        )
+        eligible_in_any = False
+        for req in all_requirements:
+            try:
+                governance_policy.get_vote_weight(
+                    req,
+                    request.user_role,
+                    request.user_trust_level,
+                )
+                eligible_in_any = True
+                break
+            except NotEligibleError:
+                continue
+        if not eligible_in_any:
+            raise NotEligibleError(
+                f"Role '{request.user_role}' with trust {request.user_trust_level} "
+                "is not eligible to vote on this submission under any applicable tier."
+            )
 
     # Validate override vote value
     if request.is_override and request.vote not in ("approve", "reject", "voided"):
@@ -211,7 +229,10 @@ async def cast_vote(
     # ── Admin Override — forced terminal state ────────────────────────────────
     if request.is_override:
         forced_status = _vote_to_status(request.vote)
-        lineage_sum = await _resolve_lineage_sum(current_ledger.id, db)
+        # current_ledger may be None for a missing submission with no ledger entries;
+        # guard defensively — SubmissionNotFoundError was already raised above.
+        supersedes_id = current_ledger.id if current_ledger is not None else None
+        lineage_sum = await _resolve_lineage_sum(supersedes_id, db)
         target = _target_trust(forced_status, config)
         trust_delta = target - lineage_sum
 
@@ -221,7 +242,7 @@ async def cast_vote(
             scoring_snapshot_id=snapshot.id,
             status=forced_status,
             trust_delta=trust_delta,
-            supersedes=current_ledger.id,
+            supersedes=supersedes_id,
             supersede_reason=SupersedeReason.ADMIN_OVERWRITE,
         )
         db.add(new_ledger)
@@ -255,24 +276,38 @@ async def cast_vote(
 
     # ── Normal vote — tally and threshold evaluation ──────────────────────────
 
-    # Step 6 — recompute latest-wins tally
+    # Step 6 — recompute latest-wins tally across ALL applicable tiers.
+    # The submission finalizes when ANY tier's threshold is met.
     active_votes = await _latest_vote_per_user(submission_id, db)
-    approve_weight, reject_weight = _compute_tally(
-        active_votes, requirements, governance_policy
-    )
-    threshold = requirements.threshold_score
 
-    tally = VoteTally(approve=approve_weight, reject=reject_weight)
-    threshold_met = approve_weight >= threshold or reject_weight >= threshold
+    threshold_met = False
     final_status: str | None = None
+    winning_approve = 0
+    winning_reject = 0
+
+    for req in all_requirements:
+        approve_weight, reject_weight = _compute_tally(active_votes, req, governance_policy)
+        if approve_weight >= req.threshold_score or reject_weight >= req.threshold_score:
+            threshold_met = True
+            winning_approve = approve_weight
+            winning_reject = reject_weight
+            final_status = (
+                StatusLedgerStatus.APPROVED
+                if approve_weight >= req.threshold_score
+                else StatusLedgerStatus.REJECTED
+            )
+            break  # first (most-restrictive) tier that meets threshold wins
+
+    # Use first tier's tally for response display when no threshold met
+    if not threshold_met:
+        winning_approve, winning_reject = _compute_tally(
+            active_votes, all_requirements[0], governance_policy
+        )
+
+    tally = VoteTally(approve=winning_approve, reject=winning_reject)
 
     # Step 7 — finalize if threshold met
     if threshold_met:
-        final_status = (
-            StatusLedgerStatus.APPROVED
-            if approve_weight >= threshold
-            else StatusLedgerStatus.REJECTED
-        )
         lineage_sum = await _resolve_lineage_sum(current_ledger.id, db)
         target = _target_trust(final_status, config)
         trust_delta = target - lineage_sum
@@ -302,15 +337,15 @@ async def cast_vote(
             extra={
                 "submission_id": str(submission_id),
                 "final_status": final_status,
-                "approve_weight": approve_weight,
-                "reject_weight": reject_weight,
+                "approve_weight": winning_approve,
+                "reject_weight": winning_reject,
                 "trust_delta": trust_delta,
             },
         )
 
     message = (
-        f"Vote registered. Approve weight: {approve_weight}, "
-        f"Reject weight: {reject_weight}, Threshold: {threshold}."
+        f"Vote registered. Approve weight: {winning_approve}, "
+        f"Reject weight: {winning_reject}."
     )
     if threshold_met:
         message += f" Submission {final_status}."

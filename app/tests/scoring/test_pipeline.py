@@ -99,15 +99,9 @@ class TestRuleResult:
 # ── ScoringPipeline — empty ────────────────────────────────────────────────────
 
 class TestEmptyPipeline:
-    def test_empty_pipeline_total_score_is_zero(self):
-        pipeline = ScoringPipeline(rules=[])
-        result = pipeline.run(DummyPayload(), _ctx())
-        assert result.total_score == 0.0
-
-    def test_empty_pipeline_breakdown_is_empty(self):
-        pipeline = ScoringPipeline(rules=[])
-        result = pipeline.run(DummyPayload(), _ctx())
-        assert result.breakdown == []
+    def test_empty_pipeline_raises_value_error(self):
+        with pytest.raises(ValueError, match="A ScoringPipeline requires at least one ScoringRule"):
+            ScoringPipeline(rules=[])
 
 
 # ── ScoringPipeline — single rule ─────────────────────────────────────────────
@@ -239,10 +233,9 @@ class TestPipelineWeightValidation:
         with pytest.raises(ValueError, match="weights must sum to 1.0"):
             ScoringPipeline([FixedRule("r", weight=0.5, fixed_score=1.0)])
 
-    def test_empty_pipeline_does_not_raise(self):
-        # Empty pipelines are exempt — no weights to sum
-        pipeline = ScoringPipeline([])
-        assert pipeline.run(DummyPayload(), _ctx()).total_score == 0.0
+    def test_empty_pipeline_raises_value_error(self):
+        with pytest.raises(ValueError, match="A ScoringPipeline requires at least one ScoringRule"):
+            ScoringPipeline([])
 
     def test_weights_summing_to_one_accepted(self):
         pipeline = ScoringPipeline([

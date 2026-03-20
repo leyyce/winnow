@@ -1,21 +1,24 @@
 """
-Abstract GovernancePolicy — contract for project-specific governance rules.
+Universal Governance Engine for Winnow.
 
-Winnow is the Governance Authority: it owns the validation process state and
-determines review requirements ("Target State") per submission. The client
-(Laravel) acts as a Task Client, rendering whatever Winnow permits.
+Sprint 6 refactoring
+---------------------
+``GovernancePolicy`` replaces all project-specific governance
+implementations (e.g. ``TreeGovernancePolicy``).  The evaluation math is
+identical for every project — only the tier configuration differs, and
+that is injected from the project registry (Rule 3: Config is King).
 
-Sprint 5 upgrade
------------------
-``is_eligible_reviewer`` now implements a three-step evaluation:
-
-1. **Blocked roles** — absolute exclusion, no fallback.
-2. **role_configs lookup** — use role-specific weight and min_trust if listed.
-3. **default_config fallback** — apply to any role not in role_configs.
-4. **Trust floor check** — reject if reviewer_trust < cfg.min_trust.
-
-Eligibility weight is returned as a second value so callers (VotingService)
-can accumulate it without a second call.
+Key behaviours
+--------------
+* ``determine_requirements`` returns **all** tiers whose
+  ``score_threshold <= confidence_score`` (cumulative / multi-tier).
+  Every matching tier is an independent pathway to finalization.
+* ``get_vote_weight`` evaluates a single ``RequiredValidations`` tier
+  snapshot with the three-step blocked → role_configs → default_config
+  logic from the Sprint 5 blueprint.
+* No project-specific subclasses are needed.  Register a
+  ``GovernancePolicy`` instance directly in each project's
+  ``ProjectRegistryEntry``.
 
 References
 ----------
@@ -25,37 +28,104 @@ References
 """
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 
+from app.core.exceptions import NotEligibleError
 from app.schemas.envelope import UserContext
-from app.schemas.results import RequiredValidations
+from app.schemas.results import RequiredValidations, RoleConfig
 
 
-class GovernancePolicy(ABC):
+@dataclass(frozen=True)
+class GovernanceTier:
     """
-    Abstract base for project-specific governance rules.
+    A single review tier — applies when ``confidence_score >= score_threshold``.
 
-    Concrete implementations determine who must review a submission (Target
-    State) based on the Confidence Score and project-configured review tiers.
-    All thresholds and role constraints must be injected via __init__.
+    All values are project-specific and injected from the registry (Rule 3).
+
+    Attributes
+    ----------
+    score_threshold:
+        Minimum Confidence Score (0–100) for this tier to apply.
+    review_tier:
+        Human-readable label, e.g. ``'peer_review'``, ``'expert_review'``.
+    threshold_score:
+        Minimum accumulated role-weight needed to finalise a submission.
+    role_configs:
+        Per-role weight and min_trust map.  Roles absent fall back to
+        ``default_config``.
+    default_config:
+        Fallback config for roles not listed in ``role_configs`` and not
+        in ``blocked_roles``.
+    blocked_roles:
+        Roles that are absolutely ineligible — takes precedence over all.
     """
 
-    @abstractmethod
+    score_threshold: float
+    review_tier: str
+    threshold_score: int
+    role_configs: dict[str, RoleConfig]
+    default_config: RoleConfig
+    blocked_roles: list[str] = field(default_factory=list)
+
+
+class GovernancePolicy:
+    """
+    Project-agnostic governance engine driven entirely by registry config.
+
+    All projects share the same evaluation logic.  Differences in review
+    thresholds, role weights, and trust floors are expressed purely through
+    the ``GovernanceTier`` list injected at construction time (Rule 3).
+    """
+
+    def __init__(self, tiers: list[GovernanceTier]) -> None:
+        if not tiers:
+            raise ValueError("GovernancePolicy requires at least one GovernanceTier.")
+        # Sort descending by score_threshold so iteration is most-restrictive-first
+        self._tiers = sorted(tiers, key=lambda t: t.score_threshold, reverse=True)
+
     def determine_requirements(
         self,
         confidence_score: float,
         user_context: UserContext,
-    ) -> RequiredValidations:
+    ) -> list[RequiredValidations]:
         """
-        Return the review requirements (Target State) for a scored submission.
+        Return ALL tiers whose ``score_threshold <= confidence_score``.
 
-        The returned ``RequiredValidations`` must include the full
-        ``role_configs``, ``default_config``, and ``blocked_roles`` snapshot
-        so the VotingService can evaluate eligibility from stored data without
-        re-calling governance logic.
+        Multiple tiers may match — each represents an independent valid
+        pathway to finalization.  The list is ordered most-restrictive first
+        (highest score_threshold first).
+
+        If no tier matches (score below all thresholds) the least-restrictive
+        tier is returned as a single-element fallback so there is always at
+        least one governance pathway.
         """
+        matching = [
+            RequiredValidations(
+                threshold_score=t.threshold_score,
+                role_configs=t.role_configs,
+                default_config=t.default_config,
+                blocked_roles=t.blocked_roles,
+                review_tier=t.review_tier,
+            )
+            for t in self._tiers
+            if confidence_score >= t.score_threshold
+        ]
 
-    @abstractmethod
+        if not matching:
+            # Fallback: always return the least-restrictive tier
+            fallback = self._tiers[-1]
+            matching = [
+                RequiredValidations(
+                    threshold_score=fallback.threshold_score,
+                    role_configs=fallback.role_configs,
+                    default_config=fallback.default_config,
+                    blocked_roles=fallback.blocked_roles,
+                    review_tier=fallback.review_tier,
+                )
+            ]
+
+        return matching
+
     def get_vote_weight(
         self,
         requirements: RequiredValidations,
@@ -63,14 +133,45 @@ class GovernancePolicy(ABC):
         reviewer_trust: int,
     ) -> int:
         """
-        Return the effective vote weight for an eligible reviewer.
+        Return the effective vote weight for an eligible reviewer against
+        a specific ``RequiredValidations`` tier snapshot.
 
         Raises ``NotEligibleError`` (from app.core.exceptions) if the reviewer
-        does not meet the eligibility criteria for these requirements.
+        does not meet the eligibility criteria for this tier.
 
         Evaluation order:
-        1. If role is in ``requirements.blocked_roles`` → raise NotEligibleError.
-        2. Look up cfg = role_configs.get(role, default_config).
-        3. If reviewer_trust < cfg.min_trust → raise NotEligibleError.
-        4. Return cfg.weight.
+        1. Blocked roles — absolute exclusion, no fallback.
+        2. role_configs lookup (or default_config fallback).
+        3. Trust floor check.
+        4. Return cfg.weight (0 weight → ineligible).
         """
+        # Step 1: absolute block — no fallback to default
+        if reviewer_role in requirements.blocked_roles:
+            raise NotEligibleError(
+                f"Role '{reviewer_role}' is permanently blocked from voting."
+            )
+
+        # Step 2: role-specific or default config
+        cfg = requirements.role_configs.get(reviewer_role, requirements.default_config)
+
+        # Step 3: trust floor
+        if reviewer_trust < cfg.min_trust:
+            raise NotEligibleError(
+                f"Trust level {reviewer_trust} is below the required "
+                f"{cfg.min_trust} for role '{reviewer_role}'."
+            )
+
+        # Step 4: weight=0 means this role is effectively ineligible
+        if cfg.weight == 0:
+            raise NotEligibleError(
+                f"Role '{reviewer_role}' has weight 0 and cannot contribute to voting."
+            )
+
+        return cfg.weight
+
+    def reaches_threshold(self, threshold: int) -> bool:
+        lowest_tier_threshold = min(t.score_threshold for t in self._tiers)
+
+        return lowest_tier_threshold <= threshold
+
+__all__ = ["GovernanceTier", "GovernancePolicy"]

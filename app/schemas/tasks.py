@@ -9,7 +9,6 @@ References
 ----------
 * API contract: docs/architecture/03_api_contracts.md §6
 """
-
 from __future__ import annotations
 
 from uuid import UUID
@@ -17,6 +16,7 @@ from uuid import UUID
 from pydantic import AwareDatetime, BaseModel, Field
 
 from app.schemas.results import RequiredValidations
+from app.schemas.voting import ActiveVoteItem
 
 
 class TaskItem(BaseModel):
@@ -25,6 +25,10 @@ class TaskItem(BaseModel):
 
     Contains enough context for the client to render the task card and
     determine routing without a separate round-trip to the scoring endpoint.
+
+    ``review_tiers`` contains ALL governance tiers whose ``score_threshold``
+    the submission's confidence score meets.  Multiple tiers may apply;
+    any one of them constitutes a valid pathway to finalization.
     """
 
     submission_id: UUID = Field(
@@ -43,12 +47,16 @@ class TaskItem(BaseModel):
         le=100.0,
         description="Confidence Score computed at submission time.",
     )
-    review_tier: str = Field(
-        min_length=1,
-        description="Review tier label, e.g. 'peer_review', 'expert_review'.",
+    review_tiers: list[RequiredValidations] = Field(
+        description=(
+            "All applicable governance tiers for this submission.  "
+            "Each tier is an independent pathway to finalization."
+        ),
     )
-    required_validations: RequiredValidations = Field(
-        description="Governance Target State — review requirements for this submission.",
+    active_votes: list[ActiveVoteItem] = Field(
+        default_factory=list,
+        serialization_alias="votes",
+        description="Latest resolved vote per reviewer (append-only latest-wins).",
     )
     submitted_at: AwareDatetime = Field(
         description="ISO-8601 timestamp of when the submission was originally created.",

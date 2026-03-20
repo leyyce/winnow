@@ -1,6 +1,6 @@
 # 05 — Database Design
 
-> **Sprint 5 (Lifecycle Ledger)**: Complete architectural rewrite. See [sprint_5_report.md](../sprints/sprint_5_report.md) for the change narrative.
+> **Sprint 5 (Lifecycle Ledger)**: Complete architectural rewrite. See [sprint_5_report.md](../sprints/sprint_5_0_report.md) for the change narrative.
 
 ---
 

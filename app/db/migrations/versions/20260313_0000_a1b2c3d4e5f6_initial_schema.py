@@ -334,7 +334,7 @@ def upgrade() -> None:
             server_default="pending",
         ),
         sa.CheckConstraint(
-            "status IN ('pending', 'processing', 'sent', 'failed', 'dead')",
+            "status IN ('pending', 'processing', 'delivered', 'failed', 'dead')",
             name="ck_webhook_outbox_status",
         ),
         sa.Column("attempts", sa.Integer(), nullable=False, server_default="0"),

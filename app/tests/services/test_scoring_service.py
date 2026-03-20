@@ -103,7 +103,10 @@ async def test_process_submission_required_validations_new_schema(
 ) -> None:
     """required_validations must expose Sprint 5 role_configs/default_config/blocked_roles."""
     result = await process_submission(_envelope(), db_session)
-    rv = result.required_validations
+    # required_validations is now a list of all applicable tiers (cumulative)
+    assert isinstance(result.required_validations, list)
+    assert len(result.required_validations) >= 1
+    rv = result.required_validations[0]
     assert rv.threshold_score >= 1
     assert isinstance(rv.role_configs, dict)
     assert isinstance(rv.default_config.weight, int)

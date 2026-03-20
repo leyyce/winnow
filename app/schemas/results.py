@@ -17,6 +17,8 @@ from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, Field, model_validator
 
+from app.schemas.voting import ActiveVoteItem
+
 
 class RuleBreakdown(BaseModel):
     """Per-rule contribution to the overall Confidence Score."""
@@ -197,19 +199,16 @@ class ScoringResultResponse(BaseModel):
     breakdown: list[RuleBreakdown] = Field(
         description="Per-rule scoring contributions from the latest scoring snapshot.",
     )
-    required_validations: RequiredValidations = Field(
-        description="Governance Target State snapshot.",
+    required_validations: list[RequiredValidations] = Field(
+        description="All governance tiers applicable to this submission (score >= tier threshold).",
     )
     thresholds: ThresholdConfig = Field(
         description="Project-specific score thresholds for client-side routing.",
     )
-    current_user_vote: str | None = Field(
-        default=None,
-        description=(
-            "The requesting user's active vote value ('approve', 'reject', "
-            "'voided') or null if no vote has been cast.  Derived from the "
-            "latest vote row for (submission_id, user_id)."
-        ),
+    active_votes: list[ActiveVoteItem] = Field(
+        default_factory=list,
+        serialization_alias="votes",
+        description="Latest resolved vote per reviewer (append-only latest-wins).",
     )
     ledger_entry_id: UUID = Field(
         description="UUID of the active StatusLedger entry this response reflects.",

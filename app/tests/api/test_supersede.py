@@ -179,32 +179,46 @@ async def test_override_unknown_submission_returns_404(async_client: AsyncClient
     assert response.status_code == 404
 
 
-async def test_override_already_finalized_returns_409(async_client: AsyncClient) -> None:
-    """Admin override on an already-finalized submission returns 409."""
+async def test_override_already_finalized_succeeds(async_client: AsyncClient) -> None:
+    """Admin override on an already-finalized submission must succeed (200).
+
+    Per the Post-Sprint 5 spec: admins can cast override votes regardless of
+    the current terminal status.  A second override (e.g. voiding an approved
+    submission) must be accepted, not rejected with 409.
+    """
     body = await _submit(async_client)
     sid = body["submission_id"]
 
     if body["status"] != "pending_review":
         pytest.skip("Submission was auto-finalized — cannot test double-override")
 
-    override_request = {
-        "user_id": str(uuid4()),
-        "vote": "approve",
-        "is_override": True,
-        "user_trust_level": 99,
-        "user_role": "admin",
-    }
-    # First override succeeds
+    # First override: pending_review → approved
     r1 = await async_client.patch(
-        f"/api/v1/submissions/{sid}/override", json=override_request
+        f"/api/v1/submissions/{sid}/override",
+        json={
+            "user_id": str(uuid4()),
+            "vote": "approve",
+            "is_override": True,
+            "user_trust_level": 99,
+            "user_role": "admin",
+        },
     )
     assert r1.status_code == 200
+    assert r1.json()["status"] == "approved"
 
-    # Second override must fail — already finalized
+    # Second override: approved → voided (admin can always override)
     r2 = await async_client.patch(
-        f"/api/v1/submissions/{sid}/override", json=override_request
+        f"/api/v1/submissions/{sid}/override",
+        json={
+            "user_id": str(uuid4()),
+            "vote": "voided",
+            "is_override": True,
+            "user_trust_level": 99,
+            "user_role": "admin",
+        },
     )
-    assert r2.status_code == 409
+    assert r2.status_code == 200
+    assert r2.json()["status"] == "voided"
 
 
 # ── Auto-supersede via POST /submissions ─────────────────────────────────────

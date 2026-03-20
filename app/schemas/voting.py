@@ -17,7 +17,23 @@ from __future__ import annotations
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import AwareDatetime, BaseModel, Field
+
+
+class ActiveVoteItem(BaseModel):
+    """
+    A single resolved (latest-wins) vote for a submission.
+
+    Returned in the ``active_votes`` list on submission and task responses
+    so clients can display who voted what without a separate round-trip.
+    """
+
+    user_id: UUID = Field(description="Reviewer's stable identifier.")
+    user_role: str = Field(description="Role at vote time.")
+    vote: str = Field(description="Active vote value: 'approve', 'reject', or 'voided'.")
+    is_override: bool = Field(description="True if this was an admin power-vote override.")
+    note: str | None = Field(default=None, description="Optional comment accompanying the vote.")
+    created_at: AwareDatetime = Field(description="Timestamp of the vote row (latest wins).")
 
 
 class VoteRequest(BaseModel):

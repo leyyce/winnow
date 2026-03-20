@@ -371,9 +371,8 @@ class TestScoringResultResponse:
             status="pending_review",
             confidence_score=72.5,
             breakdown=[],
-            required_validations=_required_validations(),
+            required_validations=[_required_validations()],
             thresholds=_thresholds(),
-            current_user_vote=None,
             ledger_entry_id=uuid4(),
             created_at=_NOW,
         )

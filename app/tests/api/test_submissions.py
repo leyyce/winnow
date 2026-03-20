@@ -240,8 +240,10 @@ async def test_post_submission_required_validations_has_threshold_score(
 ) -> None:
     """required_validations in 201 body must contain threshold_score >= 1."""
     response = await async_client.post("/api/v1/submissions", json=_valid_envelope())
-    rv = response.json()["required_validations"]
-
+    # required_validations is now a list of tiers — check the first (most restrictive)
+    rv_list = response.json()["required_validations"]
+    assert isinstance(rv_list, list) and len(rv_list) >= 1
+    rv = rv_list[0]
     assert "threshold_score" in rv
     assert rv["threshold_score"] >= 1
 
@@ -251,7 +253,7 @@ async def test_post_submission_required_validations_has_role_configs(
 ) -> None:
     """required_validations must contain role_configs, default_config, blocked_roles (Sprint 5)."""
     response = await async_client.post("/api/v1/submissions", json=_valid_envelope())
-    rv = response.json()["required_validations"]
+    rv = response.json()["required_validations"][0]
 
     assert "role_configs" in rv
     assert "default_config" in rv
@@ -268,7 +270,7 @@ async def test_post_submission_required_validations_no_old_fields(
 ) -> None:
     """required_validations must NOT contain the old min_validators or required_role fields."""
     response = await async_client.post("/api/v1/submissions", json=_valid_envelope())
-    rv = response.json()["required_validations"]
+    rv = response.json()["required_validations"][0]
 
     assert "min_validators" not in rv
     assert "required_role" not in rv

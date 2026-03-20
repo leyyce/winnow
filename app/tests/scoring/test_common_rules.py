@@ -263,6 +263,6 @@ class TestScoringRegistry:
         assert isinstance(entry.trust_advisor, TrustAdvisor)
 
     def test_tree_app_has_governance_policy(self):
-        from app.governance.projects.trees import TreeGovernancePolicy
+        from app.governance.base import GovernancePolicy
         entry = registry.get_config("tree-app")
-        assert isinstance(entry.governance_policy, TreeGovernancePolicy)
+        assert isinstance(entry.governance_policy, GovernancePolicy)

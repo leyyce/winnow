@@ -35,6 +35,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Type
+from urllib.parse import urlparse
 
 from pydantic import BaseModel
 
@@ -66,12 +67,32 @@ class ProjectRegistryEntry:
     webhook_url: str | None = None
 
     def __post_init__(self) -> None:
+
+        # 1. Check Payload Schema
+        if not issubclass(self.payload_schema, BaseModel):
+            raise TypeError(f"payload_schema must be a Pydantic BaseModel, got {self.payload_schema}")
+
+        # 2. Check Entity Types
         if self.valid_entity_types is None:
             raise ValueError(
                 f"ProjectRegistryEntry requires 'valid_entity_types' to be set. "
                 "Define the accepted entity types in the ProjectBuilder."
             )
+        # 3. Check Webhook URL
+        if not self.webhook_url:
+            raise ValueError("webhook_url cannot be empty.")
 
+        parsed_url = urlparse(self.webhook_url)
+        if parsed_url.scheme not in ("http", "https"):
+            raise ValueError(f"webhook_url must be a valid HTTP/HTTPS URL. Got: '{self.webhook_url}'")
+
+        # 4. Ensure dependencies are not accidentally None
+        if self.pipeline is None or self.trust_advisor is None or self.governance_policy is None:
+            raise ValueError("pipeline, trust_advisor, and governance_policy must all be initialized.")
+
+        # 5. Ensure every confidence score in the manual vote range is reachable by a governance policy
+        if not self.governance_policy.reaches_threshold(self.thresholds.manual_review_min):
+            raise ValueError(f"Manual vote range not fully covered by governance policies. manual_review_min: {self.thresholds.manual_review_min}")
 
 class Registry:
     """

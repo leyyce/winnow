@@ -45,20 +45,22 @@ class ScoringPipeline:
     _WEIGHT_TOLERANCE = 1e-6
 
     def __init__(self, rules: list[ScoringRule]) -> None:
+        if not rules:
+            raise ValueError("A ScoringPipeline requires at least one ScoringRule.")
         for rule in rules:
             if not (0.0 <= rule.weight <= 1.0):
                 raise ValueError(
                     f"Rule '{rule.name}' weight {rule.weight!r} is out of bounds "
                     f"[0.0, 1.0]"
                 )
-        if rules:
-            total_weight = sum(rule.weight for rule in rules)
-            if not math.isclose(total_weight, 1.0, abs_tol=self._WEIGHT_TOLERANCE):
-                raise ValueError(
-                    f"ScoringPipeline rule weights must sum to 1.0, "
-                    f"got {total_weight:.8f} "
-                    f"(rules: {[r.name for r in rules]})"
-                )
+
+        total_weight = sum(rule.weight for rule in rules)
+        if not math.isclose(total_weight, 1.0, abs_tol=self._WEIGHT_TOLERANCE):
+            raise ValueError(
+                f"ScoringPipeline rule weights must sum to 1.0, "
+                f"got {total_weight:.8f} "
+                f"(rules: {[r.name for r in rules]})"
+            )
         self._rules = rules
 
     @property

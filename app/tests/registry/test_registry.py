@@ -16,7 +16,7 @@ from app.registry.projects.trees import TreeProjectBuilder
 from app.schemas.projects.trees import TreePayload
 from app.scoring.common.trust_advisor import TrustAdvisor
 from app.scoring.pipeline import ScoringPipeline
-from app.governance.projects.trees import TreeGovernancePolicy
+from app.governance.base import GovernancePolicy
 
 
 # ── Bootstrap ──────────────────────────────────────────────────────────────────
@@ -121,7 +121,7 @@ class TestTreeProjectBuilder:
 
     def test_governance_policy_is_tree_policy(self):
         entry = self.builder.build()
-        assert isinstance(entry.governance_policy, TreeGovernancePolicy)
+        assert isinstance(entry.governance_policy, GovernancePolicy)
 
     def test_thresholds_auto_approve_above_manual_review(self):
         entry = self.builder.build()

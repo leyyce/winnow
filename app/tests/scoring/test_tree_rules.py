@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.governance.projects.trees import GovernanceTier, TreeGovernancePolicy
+from app.governance.base import GovernanceTier, GovernancePolicy
 from app.schemas.projects.trees import SpeciesStats, TreePhotoPayload
 from app.schemas.results import RequiredValidations
 from app.registry.manager import registry
@@ -285,7 +285,7 @@ class TestTreeGovernancePolicy:
         # community_review: score >= 50 — expert weight 2, citizen weight 1 (min_trust 50)
         # expert_review:   score >= 0  — only expert (weight 3, min_trust 75)
         BLOCKED = ["guest", "banned"]
-        self.policy = TreeGovernancePolicy(tiers=[
+        self.policy = GovernancePolicy(tiers=[
             GovernanceTier(
                 score_threshold=80.0, review_tier="peer_review",
                 threshold_score=1,
@@ -321,32 +321,32 @@ class TestTreeGovernancePolicy:
 
     def test_high_score_maps_to_peer_review(self):
         req = self.policy.determine_requirements(85.0, _ctx())
-        assert req.review_tier == "peer_review"
+        assert req[0].review_tier == "peer_review"
 
     def test_mid_score_maps_to_community_review(self):
         req = self.policy.determine_requirements(65.0, _ctx())
-        assert req.review_tier == "community_review"
+        assert req[0].review_tier == "community_review"
 
     def test_low_score_maps_to_expert_review(self):
         req = self.policy.determine_requirements(20.0, _ctx())
-        assert req.review_tier == "expert_review"
+        assert req[0].review_tier == "expert_review"
 
     def test_at_threshold_matches_tier(self):
         req = self.policy.determine_requirements(80.0, _ctx())
-        assert req.review_tier == "peer_review"
+        assert req[0].review_tier == "peer_review"
 
     def test_score_just_below_threshold_falls_to_lower_tier(self):
-        # 79.9 is just below peer_review threshold → community_review
+        # 79.9 is just below peer_review threshold → community_review + expert_review
         req = self.policy.determine_requirements(79.9, _ctx())
-        assert req.review_tier == "community_review"
+        assert req[0].review_tier == "community_review"
 
     def test_score_exactly_zero_maps_to_lowest_tier(self):
         req = self.policy.determine_requirements(0.0, _ctx())
-        assert req.review_tier == "expert_review"
+        assert req[0].review_tier == "expert_review"
 
     def test_tiers_sorted_automatically(self):
         # Pass tiers in wrong order — policy must sort them descending
-        policy = TreeGovernancePolicy(tiers=[
+        policy = GovernancePolicy(tiers=[
             GovernanceTier(
                 score_threshold=0.0, review_tier="expert_review",
                 threshold_score=3,
@@ -360,35 +360,35 @@ class TestTreeGovernancePolicy:
                 default_config=RoleConfig(weight=1, min_trust=30),
             ),
         ])
-        assert policy.determine_requirements(90.0, _ctx()).review_tier == "peer_review"
+        assert policy.determine_requirements(90.0, _ctx())[0].review_tier == "peer_review"
 
     def test_empty_tiers_raises(self):
         with pytest.raises(ValueError):
-            TreeGovernancePolicy(tiers=[])
+            GovernancePolicy(tiers=[])
 
     # ── RequiredValidations fields on result ──────────────────────────────────
 
     def test_determine_requirements_returns_threshold_score(self):
         req = self.policy.determine_requirements(85.0, _ctx())
-        assert req.threshold_score == 1
+        assert req[0].threshold_score == 1
 
     def test_determine_requirements_returns_role_configs(self):
         req = self.policy.determine_requirements(85.0, _ctx())
-        assert "citizen" in req.role_configs
-        assert "expert" in req.role_configs
-        assert req.role_configs["citizen"].weight == 1
-        assert req.role_configs["expert"].weight == 1
+        assert "citizen" in req[0].role_configs
+        assert "expert" in req[0].role_configs
+        assert req[0].role_configs["citizen"].weight == 1
+        assert req[0].role_configs["expert"].weight == 1
 
     def test_community_review_has_correct_threshold_and_weights(self):
         req = self.policy.determine_requirements(65.0, _ctx())
-        assert req.threshold_score == 2
-        assert req.role_configs["citizen"].weight == 1
-        assert req.role_configs["expert"].weight == 2
+        assert req[0].threshold_score == 2
+        assert req[0].role_configs["citizen"].weight == 1
+        assert req[0].role_configs["expert"].weight == 2
 
     def test_expert_review_citizen_not_in_role_configs(self):
         req = self.policy.determine_requirements(20.0, _ctx())
         # citizen absent from role_configs in expert_review; default_config has weight=0
-        assert "citizen" not in req.role_configs
+        assert "citizen" not in req[0].role_configs
 
     # ── Reviewer eligibility via get_vote_weight ──────────────────────────────
 
@@ -492,11 +492,9 @@ class TestScoringPipelineIntegration:
         # height rule contributes 0, distance rule contributes 0.5 × 1.0 × 100 = 50
         assert result.total_score == pytest.approx(50.0)
 
-    def test_empty_pipeline_gives_zero(self):
-        # Empty pipelines are exempt from the weight-sum constraint
-        result = ScoringPipeline([]).run(_payload(), _ctx())
-        assert result.total_score == pytest.approx(0.0)
-        assert result.breakdown == []
+    def test_empty_pipeline_raises_value_error(self):
+        with pytest.raises(ValueError, match="A ScoringPipeline requires at least one ScoringRule"):
+            ScoringPipeline([])
 
     def test_wrong_payload_type_raises_type_error(self):
         from pydantic import BaseModel
