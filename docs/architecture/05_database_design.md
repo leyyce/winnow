@@ -126,7 +126,7 @@ Fully append-only. No UNIQUE constraint on `(submission_id, user_id)`. When a re
 | `submission_id` | UUID FK → `submissions` | Indexed |
 | `user_id` | UUID | |
 | `vote` | Text | `CHECK (vote IN ('approve','reject') OR (is_override=true AND vote='voided'))` |
-| `is_override` | Boolean | `True` = Admin Override (bypasses eligibility) |
+| `is_override` | Boolean | `True` = Admin Override (bypasses normal logic) |
 | `user_trust_level` | Integer | Snapshotted at cast time |
 | `user_role` | Text | Snapshotted at cast time |
 | `note` | Text | Nullable |

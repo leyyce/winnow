@@ -1,7 +1,7 @@
 """
 Universal Governance Engine for Winnow.
 
-Sprint 6 refactoring
+Sprint 5.1 refactoring
 ---------------------
 ``GovernancePolicy`` replaces all project-specific governance
 implementations (e.g. ``TreeGovernancePolicy``).  The evaluation math is

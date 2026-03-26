@@ -17,7 +17,7 @@
 | R7 | Trust Score Manipulation | 🟡 Medium | Low | Server-side validation, audit log, Trust Advisor model |
 | R8 | Performance Bottleneck in Scoring | 🟢 Low | Low | Async pipeline, future background jobs |
 | R9 | Missing Finalization Signal | 🟡 Medium | Medium | Stale-submission monitoring, client reminders |
-| R10 | Governance Over-Centralisation | 🟡 Medium | Low | Project-configurable policies, client override capability |
+| R10 | Governance Over-Centralisation | 🟡 Medium | Low | Project-configurable policies, admin override capability |
 
 ---
 
@@ -220,7 +220,7 @@ flowchart LR
 |---|---|
 | **Project-configurable governance** | Each project registers its own `GovernancePolicy` in the registry. New projects can define entirely different review tiers, trust thresholds, and role requirements. Winnow does not impose a one-size-fits-all workflow. |
 | **Graceful degradation** | If Winnow is unavailable, the client can fall back to a "manual review all" mode (see R5). The `GET /tasks/available` endpoint is informational — the client can still render a basic review queue without it. |
-| **Governance as advisory** | The `required_validations` in the response is metadata, not enforcement. The client decides whether to strictly follow it or apply its own overrides. The finalization endpoint accepts any `final_status` regardless of whether the required number of validators has been reached — enforcement is the client's responsibility. |
+| **Admin Override Capability** | Winnow enforces voting thresholds automatically. However, to prevent projects from getting stuck on edge cases, client admins can cast votes with the `is_override=True` flag to force an immediate outcome regardless of the standard threshold. |
 | **Clear ownership boundary** | Winnow owns the *validation process state* (scores, status, review requirements). Laravel owns the *domain data* (trees, users) and the *UI*. Neither crosses into the other's domain. |
 
 ---
@@ -239,7 +239,7 @@ flowchart LR
 | Finalization-based trust adjustment | Trust deltas are computed from ground-truth decisions, not preliminary scores. Ensures high-quality recommendations. | Trust adjustment at scoring time (rejected: based on unverified scores). |
 | Immutable submission snapshots | Winnow stores point-in-time submissions, not mutable entities. Data corrections trigger new submissions. | Mutable submissions (rejected: audit trail integrity, data drift). |
 | Winnow as Governance Authority | Winnow owns the validation workflow state (status, review requirements, task eligibility). Centralising governance saves each client project from re-implementing complex "who can review what" logic. | Client-side governance (rejected: duplicated logic, inconsistent enforcement across projects). |
-| `required_validations` as metadata | The governance Target State is returned in the response as advisory metadata, not enforced server-side. The client decides when to finalize. | Server-enforced validation counts (rejected: too rigid, blocks edge cases like admin overrides). |
+| Server-Side Threshold Evaluation | Winnow tracks individual votes and auto-finalizes submissions once accumulated `role_configs` weights meet the threshold. | Client-side vote tallying with a single `PATCH /final-status` (rejected: leads to race conditions and forces clients to duplicate governance logic). |
 | Domain exception hierarchy (`core/exceptions.py`) | Services raise `ProjectNotFoundError` / `NotImplementedYetError` instead of `fastapi.HTTPException`. The API layer translates these to RFC 7807 responses. Keeps the service layer fully decoupled from the HTTP transport — services remain testable without a running FastAPI app. | Services raise `HTTPException` directly (rejected: layer contamination, deferred imports, breaks RFC 7807 uniformity). |
 | `python-json-logger` for structured logging | Industry-standard library that correctly reads `LogRecord.created` for timestamps and preserves all `extra` fields (e.g. `submission_id`, `project_id`). Replaces a custom formatter that had two silent bugs (wrong timestamp source, discarded extra fields). | Custom `_JsonFormatter` (rejected: incorrect timestamps, lost structured context). |
 | `setup_logging()` called before `bootstrap()` in lifespan | Ensures all bootstrap warnings (skipped project builders, weight validation errors) are emitted as valid JSON records from the very first log line. Calling logging setup after bootstrap meant early records used Python's default plain-text format. | Logging configured after bootstrap (rejected: unparseable records in JSON log aggregators). |
@@ -263,6 +263,6 @@ flowchart LR
 
 6. **Finalization coverage:** For the prototype, it is assumed that most submissions will eventually receive sufficient reviewer votes. The Trust Advisor's quality depends on finalization coverage — projects with low voting rates will have less reliable trust recommendations. See R9.
 
-7. **Governance enforcement:** The `required_validations` (Target State) is advisory metadata. Winnow does not enforce that N validators have reviewed a submission before accepting a vote or an override. The client project is responsible for enforcing its own review workflow before calling `POST /votes`. This keeps Winnow flexible across diverse project workflows.
+7. **Governance enforcement:** Winnow enforces the configured role thresholds server-side via the `POST /api/v1/submissions/{id}/votes` endpoint. A submission is only auto-finalized when the accumulated weight of eligible votes meets the `threshold_score`. For flexibility, admin roles can cast votes with `is_override=True` to force an immediate outcome, ensuring edge cases aren't blocked.
 
 8. **Task query trust integrity:** The `GET /tasks/available` endpoint accepts `user_trust` and `user_role` as query parameters (sent by the client). The same manipulation risk as R7 applies — a compromised client could send inflated values. Mitigation is the same: server-to-server API key auth. End users never call Winnow directly.

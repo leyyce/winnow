@@ -106,7 +106,7 @@ def _compute_tally(
     Compute (approve_weight, reject_weight) from the list of active votes.
 
     Each vote's weight is resolved via ``governance_policy.get_vote_weight``.
-    Ineligible votes (blocked role / insufficient trust) contribute 0 weight.
+    Ineligible votes (blocked role / insufficient trust) raise NotEligibleError and are ignored.
     """
     approve_weight = 0
     reject_weight = 0

@@ -173,7 +173,7 @@ Given a `project_id`, the registry returns a `ProjectRegistryEntry` containing:
 2. The **ordered list of `ScoringRule` instances** (with their configured weights) to run (Stage 2 + Stage 4 input).
 3. The **scoring thresholds** (e.g., auto-approve ≥ 80, manual review 50–79, auto-reject < 50).
 4. The **Trust Advisor configuration** (reward/penalty rules for Stage 4 output).
-5. The **GovernancePolicy** instance (review-tier rules for task orchestration).
+5. The **GovernancePolicy** instance (configured with review-tier rules for task orchestration).
 
 ```mermaid
 flowchart LR
@@ -188,13 +188,13 @@ flowchart LR
     TREE --> TR["HeightFactor, DistanceFactor, PlausibilityFactor, CommentFactor, TrustLevel (Stage 2 + 4 input)"]
     TREE --> TT["Thresholds: approve≥80, review≥50, reject<50"]
     TREE --> TA["Trust Advisor config (Stage 4 output)"]
-    TREE --> TG["TreeGovernancePolicy (review tiers)"]
+    TREE --> TG["GovernancePolicy (configured with Tree Tiers)"]
 
     BIO --> BS["ObservationPayload schema (Stage 1)"]
     BIO --> BR["PhotoQuality, TaxonomyCheck, TrustLevel (Stage 2 + 4 input)"]
     BIO --> BT["Thresholds: approve≥75, review≥40, reject<40"]
     BIO --> BA["Trust Advisor config (Stage 4 output)"]
-    BIO --> BG["BioGovernancePolicy (review tiers)"]
+    BIO --> BG["GovernancePolicy (configured with Bio Tiers)"]
 ```
 
 ### How `scoring_service.py` Uses the Registry
@@ -421,7 +421,6 @@ sequenceDiagram
     Service->>DB: Persist Submission, Snapshots, and StatusLedger (supersedes=prev_ledger_id)
     Service-->>API: ScoringResultResponse
     API-->>Client: 201 Created {result, status: ...}
-```,search:
 ```
 
 ## 4b. Voting & Auto-Finalization — Sequence Diagram
@@ -484,7 +483,6 @@ stateDiagram-v2
     voided --> [*]
 
     note right of pending_review: Confidence Score computed.\nAwaiting reviewer votes.\nMay be superseded by a new submission.
-```,search:
     note right of approved: Trust Advisor computes\ntrust_adjustment delta.
 ```
 
@@ -538,10 +536,10 @@ The **Task Orchestration Pattern** positions Winnow as the authoritative **Gover
 
 | Principle | Detail |
 |---|---|
-| **Winnow is the Governance Authority** | Winnow is the single source of truth for the validation workflow status. It determines review requirements ("Target State") and controls task eligibility. |
-| **Client as Task Client** | The client project (Laravel) acts as a Task Client: it renders whatever Winnow permits. It calls `GET /tasks/available?user_trust=X` to discover which submissions the current user may review, and displays them accordingly. |
-| **Score-driven governance** | Review requirements are determined by the Confidence Score and project-specific governance rules (e.g., "score > 90% needs 1 peer review; score < 50% needs expert review"). |
-| **Project-configurable** | Each project registers its own `GovernancePolicy` with custom review tiers. New projects can define entirely different governance rules. |
+| **Winnow is the Governance Authority** | Winnow is the single source of truth for the validation workflow status. It determines review requirements ("Target State") across multiple independent tiers and controls task eligibility. |
+| **Client as Task Client** | The client project (Laravel) acts as a Task Client: it renders whatever Winnow permits. It calls `GET /tasks/available?user_trust=X&user_role=Y` to discover which submissions the current user may review, and displays them accordingly. |
+| **Score-driven governance** | Review requirements are determined by the Confidence Score and project-specific governance rules configured in the registry. |
+| **Project-configurable** | Each project uses the universal `GovernancePolicy` but injects its own declarative `GovernanceTier` lists. No project-specific subclasses are needed (Rule 3: Configuration is King). |
 
 ### Conceptual Interface
 
@@ -550,60 +548,78 @@ The **Task Orchestration Pattern** positions Winnow as the authoritative **Gover
 
 class RequiredValidations(BaseModel):
     """The 'Target State' — what must happen before this submission can be finalized."""
-    threshold_score: int         # minimum accumulated role-weight to finalise
-    role_weights: dict[str, int] # role -> weight contribution per vote
-    required_min_trust: int      # minimum trust level for eligible reviewers
-    review_tier: str             # e.g., "peer_review", "community_review"
+    threshold_score: int                 # minimum accumulated role-weight to finalise
+    role_configs: dict[str, RoleConfig]  # role -> specific weight and min_trust
+    default_config: RoleConfig | None    # fallback config for roles not listed
+    blocked_roles: list[str]             # roles that are absolutely ineligible
+    review_tier: str                     # e.g., "peer_review", "expert_review"
 
+class GovernancePolicy:
+    """Universal governance engine driven entirely by registry config."""
 
-class GovernancePolicy(ABC):
-    """Abstract base for project-specific governance rules."""
-
-    @abstractmethod
     def determine_requirements(
         self,
         confidence_score: float,
         user_context: UserContext,
-    ) -> RequiredValidations:
-        """Given a scored submission, determine the review requirements."""
+    ) -> list[RequiredValidations]:
+        """Given a scored submission, determine the review requirements.
+        Returns ALL tiers whose score_threshold <= confidence_score."""
         ...
 
-    @abstractmethod
-    def is_eligible_reviewer(
-        self,
-        submission_score: float,
-        submission_requirements: RequiredValidations,
-        reviewer_trust: int,
+    @staticmethod
+    def get_vote_weight(
+        requirements: RequiredValidations,
         reviewer_role: str,
-    ) -> bool:
-        """Can a reviewer with the given trust/role review this submission?"""
+        reviewer_trust: int,
+    ) -> int:
+        """Evaluates eligibility for a single tier snapshot.
+        Returns the vote weight if eligible, else raises NotEligibleError."""
         ...
 ```
 
-### Tree-App Governance Example
+### Tree-App Governance Configuration Example
+
+Instead of hardcoding rules in subclasses, the project builder simply injects a list of `GovernanceTier` objects into the universal `GovernancePolicy`:
 
 ```python
 # Conceptual pseudo-code — NOT implementation
 
-class TreeGovernancePolicy(GovernancePolicy):
-    """Governance rules for the tree-tracking project."""
-
-    def determine_requirements(self, confidence_score, user_context):
-        if confidence_score >= 90:
-            return RequiredValidations(
-                threshold_score=1, role_weights={"citizen": 1, "expert": 1},
-                required_min_trust=30, review_tier="peer_review"
-            )
-        elif confidence_score >= 50:
-            return RequiredValidations(
-                threshold_score=2, role_weights={"citizen": 1, "expert": 2},
-                required_min_trust=50, review_tier="community_review"
-            )
-        else:  # score < 50
-            return RequiredValidations(
-                threshold_score=2, role_weights={"expert": 2},
-                required_min_trust=70, review_tier="expert_review"
-            )
+governance_policy = GovernancePolicy(
+    tiers=[
+        GovernanceTier(
+            confidence_threshold=75.0,
+            review_tier="peer_review",
+            vote_threshold=1,
+            role_configs={
+                "expert": RoleConfig(weight=1, min_trust=0),
+                "citizen": RoleConfig(weight=1, min_trust=30),
+            },
+            default_config=RoleConfig(weight=1, min_trust=30),
+            blocked_roles=["guest", "banned"]
+        ),
+        GovernanceTier(
+            confidence_threshold=50.0,
+            review_tier="community_review",
+            vote_threshold=2,
+            role_configs={
+                "expert": RoleConfig(weight=2, min_trust=0),
+                "citizen": RoleConfig(weight=1, min_trust=50),
+            },
+            default_config=RoleConfig(weight=1, min_trust=50),
+            blocked_roles=["guest", "banned"]
+        ),
+        GovernanceTier(
+            confidence_threshold=0.0,
+            review_tier="expert_review",
+            vote_threshold=3,
+            role_configs={
+                "expert": RoleConfig(weight=3, min_trust=75),
+            },
+            # default_config=None (only experts allowed)
+            blocked_roles=["guest", "banned"]
+        )
+    ]
+)
 ```
 
 ### Task Query Flow
@@ -620,12 +636,12 @@ sequenceDiagram
     API->>GovService: get_available_tasks(project_id, user_trust=5, user_role="trusted")
 
     GovService->>DB: Query submissions WHERE status="pending_review"
-    DB-->>GovService: [submissions with required_validations]
+    DB-->>GovService: [submissions with required_validations JSON arrays]
 
-    GovService->>GovService: Filter: for each submission,<br/>policy.is_eligible_reviewer(score, requirements, trust=5, role="trusted")
+    GovService->>GovService: Filter: for each submission and each tier,<br/>try: GovernancePolicy.get_vote_weight(...)
 
-    GovService-->>API: [eligible submissions]
-    API-->>Laravel: 200 OK {tasks: [{submission_id, score, review_tier, ...}]}
+    GovService-->>API: [submissions where reviewer is eligible in >=1 tier]
+    API-->>Laravel: 200 OK {tasks: [{submission_id, score, review_tiers, ...}]}
     Laravel->>Laravel: Render review queue UI
 ```
 
@@ -744,8 +760,7 @@ graph TB
         G[ScoringPipeline]
     end
     subgraph "Governance Authority (governance/)"
-        GP[GovernancePolicy ABC]
-        GP1[TreeGovernancePolicy]
+        GP[GovernancePolicy]
     end
     subgraph "Stage 4-output — Trust Advisory (scoring/common/)"
         TA[TrustAdvisor]
@@ -762,12 +777,11 @@ graph TB
     C -->|resolves config| F
     C -->|validates payload| D1
     C -->|runs| G
-    C -->|determines requirements| GP1
+    C -->|determines requirements| GP
     C -->|on finalization| TA
-    GS -->|filters eligible tasks| GP1
+    GS -->|filters eligible tasks| GP
     G -->|iterates| E1
     E1 -.->|implements| E0
-    GP1 -.->|implements| GP
     B -->|persists via| H
     H -->|uses| I
 ```

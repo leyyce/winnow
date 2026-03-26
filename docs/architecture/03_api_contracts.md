@@ -36,7 +36,9 @@ Content-Type: application/json
   "metadata": {
     "project_id": "tree-app",
     "submission_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-    "submission_type": "tree",
+    "entity_type": "tree",
+    "entity_id": "b8f9e0d1-2a3b-4c5d-6e7f-8a9b0c1d2e3f",
+    "measurement_id": "c1d2e3f4-5a6b-7c8d-9e0f-1a2b3c4d5e6f",
     "submitted_at": "2026-03-10T17:30:00Z",
     "client_version": "1.2.0"
   },
@@ -45,11 +47,11 @@ Content-Type: application/json
     "username": "maria_oak",
     "role": "citizen",
     "trust_level": 3,
-    "total_submissions": 42,
-    "account_created_at": "2025-01-15T10:00:00Z"
+    "account_created_at": "2025-01-15T10:00:00Z",
+    "account_updated_at": null,
+    "custom_data": null
   },
   "payload": {
-    "tree_id": "b8f9e0d1-2a3b-4c5d-6e7f-8a9b0c1d2e3f",
     "species_id": "c1d2e3f4-5a6b-7c8d-9e0f-1a2b3c4d5e6f",
     "measurement": {
       "height": 18.5,
@@ -95,16 +97,19 @@ graph TD
 
     M --> M1["project_id: str"]
     M --> M2["submission_id: UUID"]
-    M --> M3["submission_type: str"]
-    M --> M4["submitted_at: datetime"]
-    M --> M5["client_version: str | None"]
+    M --> M3["entity_type: str"]
+    M --> M4["entity_id: UUID"]
+    M --> M5["measurement_id: UUID"]
+    M --> M6["submitted_at: datetime"]
+    M --> M7["client_version: str | None"]
 
     U --> U1["user_id: UUID"]
     U --> U2["username: str"]
     U --> U3["role: str (project-specific)"]
     U --> U4["trust_level: int (project-specific scale)"]
-    U --> U5["total_submissions: int"]
-    U --> U6["account_created_at: datetime"]
+    U --> U5["account_created_at: datetime"]
+    U --> U6["account_updated_at: datetime | None"]
+    U --> U7["custom_data: dict | None"]
 
     P --> P1["dict — validated per project_id (Stage 1)"]
 ```
@@ -123,17 +128,20 @@ graph TD
 class SubmissionMetadata(BaseModel):
     project_id: str                       # e.g. "tree-app"
     submission_id: UUID
-    submission_type: str                  # e.g. "tree", "shrub"
+    entity_type: str                      # e.g. "tree", "shrub"
+    entity_id: UUID                       # Triplet identity field
+    measurement_id: UUID                  # Triplet identity field
     submitted_at: AwareDatetime           # timezone-aware ISO-8601 timestamp (required)
     client_version: str | None = None
 
 class UserContext(BaseModel):
     user_id: UUID
     username: str
-    role: str = Field(min_length=1)      # project-specific roles
+    role: str = Field(min_length=1)       # project-specific roles
     trust_level: int = Field(ge=0)        # scale is project-specific
-    total_submissions: int = Field(ge=0)
     account_created_at: AwareDatetime     # timezone-aware ISO-8601 timestamp (required)
+    account_updated_at: AwareDatetime | None = None
+    custom_data: dict | None = None
 
 class SubmissionEnvelope(BaseModel):
     metadata: SubmissionMetadata
@@ -169,7 +177,6 @@ class SpeciesStats(BaseModel):
     std_trunk_diameter: float = Field(ge=0)
 
 class TreePayload(BaseModel):
-    tree_id: UUID
     species_id: UUID
     measurement: TreeMeasurementPayload
     photos: list[TreePhotoPayload] = Field(min_length=2)  # ≥ 2 photos required
@@ -183,7 +190,7 @@ class TreePayload(BaseModel):
 ```
 
 > **Key design notes vs. earlier drafts:**
-> - The payload is **flat** — `tree_id` and `species_id` sit directly on `TreePayload`, not inside a nested `TreeInfo` sub-object. Fields like `condition`, `location`, and `location_confidence` belong to Laravel's domain data and are not forwarded to Winnow.
+> - The payload is **flat** — `entity_id` and `measurement_id` are no longer embedded in `TreePayload`, but extracted to `SubmissionMetadata` for the identity triplet. Fields like `condition`, `location`, and `location_confidence` belong to Laravel's domain data and are not forwarded to Winnow.
 > - `trunk_diameter` is in **centimetres** (not mm).
 > - The distance field is `step_length_measured: bool` (was it physically measured?), not a separate `distance_to_tree` float — Winnow only needs the boolean for the Aₙ factor.
 > - Photos carry a `path` string and an optional `note`; there is no `photo_id`, `type`, or `url` field — photo identity and classification are Laravel's concern.
@@ -231,6 +238,9 @@ Content-Type: application/json
   "measurement_id": "c1d2e3f4-5a6b-7c8d-9e0f-1a2b3c4d5e6f",
   "ledger_entry_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
   "status": "pending_review",
+  "supersedes": null,
+  "supersede_reason": null,
+  "trust_delta": 0,
   "confidence_score": 67.5,
   "breakdown": [
     {
@@ -326,7 +336,7 @@ class ScoringResultResponse(BaseModel):
     breakdown: list[RuleBreakdown]
     required_validations: list[RequiredValidations]
     thresholds: ThresholdConfig
-    votes: list[ActiveVoteItem]
+    active_votes: list[ActiveVoteItem] = Field(serialization_alias="votes")
     created_at: AwareDatetime             # timezone-aware ISO-8601 timestamp
 ```
 
@@ -362,7 +372,7 @@ All error responses use a consistent structure based on [RFC 7807](https://www.r
 
 ```json
 {
-  "type": "https://winnow.example.com/errors/validation-error",
+  "type": "[https://winnow.example.com/errors/validation-error](https://winnow.example.com/errors/validation-error)",
   "title": "Payload Validation Failed",
   "status": 422,
   "detail": "Stage 1 validation failed: 2 errors in tree measurement payload.",
@@ -457,7 +467,7 @@ sequenceDiagram
     Laravel->>Winnow: GET /api/v1/tasks/available?project_id=tree-app&user_trust=5&user_role=trusted
     Winnow->>WinnowDB: Query pending_review submissions
     Winnow->>Winnow: Apply governance policy (filter by eligibility)
-    Winnow-->>Laravel: 200 {tasks: [{submission_id, score, review_tier, ...}]}
+    Winnow-->>Laravel: 200 {tasks: [{submission_id, score, review_tiers, ...}]}
     Laravel-->>User: Render eligible review tasks
     end
 ```
@@ -494,39 +504,31 @@ GET /api/v1/tasks/available?project_id=tree-app&user_trust=5&user_role=trusted
     {
       "submission_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
       "project_id": "tree-app",
-      "submission_type": "tree",
+      "entity_type": "tree",
       "confidence_score": 67.5,
-      "review_tier": "community_review",
-      "required_validations": {
-        "threshold_score": 2,
-        "role_weights": {"citizen": 1, "expert": 2},
-        "required_min_trust": 5,
-        "review_tier": "community_review"
-      },
+      "review_tiers": [
+        {
+          "threshold_score": 2,
+          "role_configs": {
+            "citizen": {"weight": 1, "min_trust": 5},
+            "expert": {"weight": 2, "min_trust": 0}
+          },
+          "default_config": {"weight": 1, "min_trust": 50},
+          "blocked_roles": ["guest"],
+          "review_tier": "community_review"
+        }
+      ],
+      "votes": [],
       "submitted_at": "2026-03-10T17:30:01Z"
-    },
-    {
-      "submission_id": "b2c3d4e5-f6a7-8901-bcde-f12345678901",
-      "project_id": "tree-app",
-      "submission_type": "tree",
-      "confidence_score": 42.0,
-      "review_tier": "expert_review",
-      "required_validations": {
-        "threshold_score": 3,
-        "role_weights": {"expert": 3},
-        "required_min_trust": 7,
-        "review_tier": "expert_review"
-      },
-      "submitted_at": "2026-03-10T18:00:00Z"
     }
   ],
-  "total": 2,
+  "total": 1,
   "page": 1,
   "per_page": 20
 }
 ```
 
-> **Note:** The second task (`expert_review`) would only appear for a reviewer with `user_trust ≥ 7` AND `user_role = expert`. Winnow applies the governance policy's `is_eligible_reviewer()` logic server-side to filter results. The client never needs to implement this logic.
+> **Note:** A task will only appear in the list if the user passes the `get_vote_weight()` eligibility check for at least one of the applicable `review_tiers`. Winnow applies this governance logic server-side. The client never needs to implement this logic.
 
 ### Response Schema (Conceptual)
 
@@ -536,10 +538,10 @@ GET /api/v1/tasks/available?project_id=tree-app&user_trust=5&user_role=trusted
 class TaskItem(BaseModel):
     submission_id: UUID
     project_id: str
-    submission_type: str
+    entity_type: str
     confidence_score: float
-    review_tier: str
-    required_validations: RequiredValidations
+    review_tiers: list[RequiredValidations]
+    active_votes: list[ActiveVoteItem] = Field(serialization_alias="votes")
     submitted_at: AwareDatetime           # timezone-aware ISO-8601 timestamp
 
 class TaskListResponse(BaseModel):
@@ -579,7 +581,7 @@ GET /api/v1/results?project_id=tree-app&status=pending_review&page=1&per_page=20
 
 2. **Photo handling:** Winnow does **not** receive raw image files. The Laravel app uploads photos to its own storage; only URLs are passed in the payload. Future ML-based image validation could fetch images on demand.
 
-3. **Submission types:** The `submission_type` field (e.g., `tree` vs. `shrub`) allows different validation rule sets within the same project. For the tree-app prototype, `tree` is the primary type.
+3. **Submission types:** The `entity_type` field (e.g., `tree` vs. `shrub`) allows different validation rule sets within the same project. For the tree-app prototype, `tree` is the primary type.
 
 4. **Species reference data:** The allometric coefficients (`a`–`g`) from `tree_species` are sent in the payload so Winnow can compute plausibility without accessing the Laravel database. If this data rarely changes, a caching mechanism on Winnow's side could be considered.
 
@@ -621,7 +623,7 @@ Content-Type: application/json
 ```python
 class VoteRequest(BaseModel):
     user_id: UUID
-    vote: Literal["approve", "reject"]
+    vote: Literal["approve", "reject", "voided"]
     user_trust_level: int = Field(ge=0)     # reviewer's current trust level (from wire)
     user_role: str = Field(min_length=1)    # reviewer's role in the client system
     note: str | None = None                 # optional reviewer comment
@@ -685,40 +687,41 @@ class VoteResponse(BaseModel):
 | `403` | `/errors/not-eligible` | The reviewer does not meet the trust/role requirements for this submission. |
 | `422` | `/errors/validation-error` | Request body validation failure. |
 
-### 9.2 Threshold Evaluation Logic — Role-Weights Pattern (Dynamic Governance)
+### 9.2 Threshold Evaluation Logic — Role Configs Pattern (Dynamic Governance)
 
 Winnow evaluates accumulated votes using a **role-weights accumulation** model. Instead of a
-flat `min_validators` count, each tier carries a `threshold_score` and a `role_weights` dict.
-The voting service sums `role_weights[voter_role]` for all eligible votes; when the accumulated
+flat `min_validators` count, each tier carries a `threshold_score` and a `role_configs` map.
+The voting service sums `role_configs[voter_role].weight` for all eligible votes; when the accumulated
 weight meets `threshold_score`, the submission is auto-finalised.
 
 This eliminates all hardcoded role checks from the service layer — the service is purely
 math-agnostic (Rule 3: Configuration is King).
 
-```
+```python
 Given:
-  - required = submission.required_validations  (RequiredValidations)
-  - votes    = all votes for this submission     (list[Vote])
+  - required = submission.review_tiers[i]  (RequiredValidations tier)
+  - votes    = all active votes for this submission
 
-# A vote is eligible if it passes both gates:
-#   1. trust gate  : v.user_trust_level >= required.required_min_trust
-#   2. weight gate : required.role_weights.get(v.user_role, 0) > 0
+# Helper to resolve config for a given role
+def get_config(role):
+    if role in required.blocked_roles:
+        return None
+    return required.role_configs.get(role, required.default_config)
 
-approve_weight = SUM(
-    required.role_weights[v.user_role]
-    for v in votes
-    if v.vote == "approve"
-    AND v.user_trust_level >= required.required_min_trust
-    AND required.role_weights.get(v.user_role, 0) > 0
-)
+approve_weight = 0
+reject_weight = 0
 
-reject_weight = SUM(
-    required.role_weights[v.user_role]
-    for v in votes
-    if v.vote == "reject"
-    AND v.user_trust_level >= required.required_min_trust
-    AND required.role_weights.get(v.user_role, 0) > 0
-)
+for v in votes:
+    config = get_config(v.user_role)
+    if config is None:
+        continue  # Blocked or no default config fallback
+        
+    # Check if user meets the minimum trust for their role to vote
+    if v.user_trust_level >= config.min_trust and config.weight > 0:
+        if v.vote == "approve":
+            approve_weight += config.weight
+        elif v.vote == "reject":
+            reject_weight += config.weight
 
 IF approve_weight >= required.threshold_score:
     → finalize as "approved", trigger Trust Advisor, queue webhook
@@ -727,16 +730,6 @@ ELIF reject_weight >= required.threshold_score:
 ELSE:
     → remain "pending_review", no action
 ```
-
-> **"2 Citizens OR 1 Expert" example (community_review tier):**
-> `threshold_score=2, role_weights={"citizen": 1, "expert": 2}, required_min_trust=50`
->
-> - Two citizen approvals: 1 + 1 = 2 ≥ threshold_score → approved ✓
-> - One expert approval:   2     = 2 ≥ threshold_score → approved ✓
-> - One citizen + one low-trust voter: only the eligible citizen contributes weight=1 < 2 → pending
->
-> The "OR" logic is expressed **entirely through the registry configuration** (role_weights values)
-> — no conditional branches in the service layer whatsoever.
 
 ### 9.3 Superseded Status — Handled Automatically
 

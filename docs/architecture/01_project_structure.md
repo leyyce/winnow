@@ -42,7 +42,7 @@ winnow/
 │   │
 │   ├── schemas/                    # Pydantic V2 models — API contracts & Stage 1 validation
 │   │   ├── __init__.py
-│   │   ├── envelope.py             # SubmissionEnvelope, UserContext, generic payload wrapper
+│   │   ├── envelope.py             # SubmissionEnvelope, SubmissionMetadata, UserContext, generic payload wrapper
 │   │   ├── results.py              # ScoringResultResponse, ScoreBreakdown response models
 │   │   ├── errors.py               # ProblemDetail schema (RFC 7807)
 │   │   └── projects/               # Project-specific payload schemas (Stage 1 validation)
@@ -65,7 +65,7 @@ winnow/
 │   ├── services/                   # Business / application logic (use cases)
 │   │   ├── __init__.py
 │   │   ├── scoring_service.py      # Orchestrates Stage 1 → Stage 2 → Stage 4 pipeline
-│   │   ├── submission_service.py   # Receives envelope → persists → triggers scoring
+│   │   ├── submission_service.py   # Thin coordinator. Receives envelope and delegates to scoring_service for atomic scoring and persistence.
 │   │   ├── governance_service.py   # Task orchestration — determines review requirements & eligible reviewers
 │   │   ├── voting_service.py       # Manages vote casting, eligibility, and threshold evaluation
 │   │   └── webhook_service.py      # Manages webhook delivery and outbox polling

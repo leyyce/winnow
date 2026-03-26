@@ -9,7 +9,7 @@ Sprint 5 (Lifecycle Ledger) changes
 * Eligibility evaluated via ``governance_policy.get_vote_weight()`` which
   implements the new role_configs / default_config / blocked_roles model.
 
-Sprint 6 (Post-Sprint refinements)
+Sprint 5.1 (Post-Sprint refinements)
 ------------------------------------
 * ``required_validations`` in ``scoring_snapshots`` is now a JSON array of
   tier dicts.  All tiers are parsed into ``list[RequiredValidations]`` and
