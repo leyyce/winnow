@@ -34,9 +34,9 @@ winnow/
 │   │   └── v1/                     # API version namespace
 │   │       ├── __init__.py
 │   │       ├── router.py           # Aggregated APIRouter for v1
-│   │       ├── submissions.py      # POST  /submissions              — main data ingestion endpoint
-│   │       ├── finalization.py     # PATCH /submissions/{id}/final-status — ground-truth signal from client
+│   │       ├── submissions.py      # POST  /submissions, PATCH /withdraw, PATCH /override
 │   │       ├── tasks.py            # GET   /tasks/available           — query reviewable submissions (governance)
+│   │       ├── voting.py           # POST  /submissions/{id}/votes    — Governance Engine threshold evaluation
 │   │       ├── results.py          # GET   /results                  — query scoring outcomes
 │   │       └── health.py           # GET /api/v1/health (canonical) + GET /health (infra alias)
 │   │
@@ -54,15 +54,21 @@ winnow/
 │   ├── models/                     # SQLAlchemy 2.0 ORM models — database layer
 │   │   ├── __init__.py
 │   │   ├── base.py                 # Declarative base, common mixins (UUID pk, timestamps)
-│   │   ├── submission.py           # Submission table (stores the envelope + raw payload as JSONB)
-│   │   ├── scoring_result.py       # ScoringResult table (score, status, breakdown, required_validations)
-│   │   └── project_config.py       # ProjectConfig table (weights, thresholds, governance rules per project)
+│   │   ├── submission.py           # Root anchor (stores envelope + raw payload as JSONB)
+│   │   ├── submission_user_snapshot.py # Snapshot of user state (role, trust) at submission time
+│   │   ├── scoring_snapshot.py     # Technical analysis output (1:N for re-scoring)
+│   │   ├── status_ledger.py        # Append-only SSOT for submission status and trust deltas
+│   │   ├── submission_vote.py      # Reviewer votes for threshold evaluation
+│   │   ├── project_config.py       # ProjectConfig table (weights, thresholds, governance rules per project)
+│   │   └── webhook_outbox.py       # Transactional Outbox for async notifications
 │   │
 │   ├── services/                   # Business / application logic (use cases)
 │   │   ├── __init__.py
 │   │   ├── scoring_service.py      # Orchestrates Stage 1 → Stage 2 → Stage 4 pipeline
 │   │   ├── submission_service.py   # Receives envelope → persists → triggers scoring
-│   │   └── governance_service.py   # Task orchestration — determines review requirements & eligible reviewers
+│   │   ├── governance_service.py   # Task orchestration — determines review requirements & eligible reviewers
+│   │   ├── voting_service.py       # Manages vote casting, eligibility, and threshold evaluation
+│   │   └── webhook_service.py      # Manages webhook delivery and outbox polling
 │   │
 │   ├── registry/                   # Top-level registry domain — wires schemas, scoring & governance
 │   │   ├── __init__.py             # Re-exports: ProjectRegistryEntry, ProjectBuilder, registry
@@ -155,9 +161,9 @@ The scoring pipeline (Stages 1 → 2 → 4-input) runs synchronously on submissi
 
 | Phase | Trigger | Result |
 |---|---|---|
-| **Initial scoring** | `POST /api/v1/submissions` | Confidence Score, `required_validations` (Target State), preliminary status (`pending_finalization`) |
+| **Initial scoring** | `POST /api/v1/submissions` | Confidence Score, `required_validations` (Target State), initial status (`pending_review`, `approved`, or `rejected`) |
 | **Task query** | `GET /api/v1/tasks/available?user_trust=X` | Submissions eligible for review by a user with the given trust level |
-| **Finalization** | `PATCH /api/v1/submissions/{id}/final-status` | Ground-truth status persisted; Trust Advisor computes `trust_adjustment` delta |
+| **Voting & Finalization** | `POST /api/v1/submissions/{id}/votes` | Reviewer decision recorded; threshold evaluation auto-triggers status change + `trust_adjustment` |
 
 ---
 
@@ -186,15 +192,16 @@ The scoring pipeline (Stages 1 → 2 → 4-input) runs synchronously on submissi
 |---|---|
 | **Role** | Map Python objects to PostgreSQL tables. |
 | **Contains** | SQLAlchemy `Mapped` classes. Strictly **no** Pydantic imports. |
+| **Immutability** | Follows an **append-only** pattern. Submissions are never updated; status changes are recorded as new entries in the `status_ledger` using the backward-pointer supersession pattern. |
 | **Rule** | Models are always separated from schemas to avoid tight coupling between API shape and DB schema. |
 
 ### `app/services/` — Application / Use-Case Layer
 
 | Concern | Detail |
 |---|---|
-| **Role** | Orchestrate domain operations: receive a submission, run Stage 1 validation via the registry's Pydantic schema, trigger the Stage 2 + Stage 4 scoring pipeline, determine governance requirements, persist results, process finalization signals, and serve task queries. |
+| **Role** | Orchestrate domain operations: receive a submission, run Stage 1 validation via the registry's Pydantic schema, trigger the Stage 2 + Stage 4 scoring pipeline, determine governance requirements, persist results, process voting signals, and serve task queries. |
 | **Contains** | Stateless service functions or thin classes that coordinate `scoring/`, `governance/` rules and `models/` persistence. |
-| **Key files** | `scoring_service.py` — resolves the project config from the registry, validates the raw payload against the project-specific Pydantic schema (Stage 1), then passes the validated object to the `ScoringPipeline` (Stage 2 + Stage 4 input). After scoring, invokes the governance policy to compute `required_validations`. On finalization, delegates to the Trust Advisor to compute the `trust_adjustment` delta (Stage 4 output). `governance_service.py` — queries eligible tasks for a given trust level using the project's governance policy. |
+| **Key files** | `scoring_service.py` — resolves the project config from the registry, validates the raw payload against the project-specific Pydantic schema (Stage 1), then passes the validated object to the `ScoringPipeline` (Stage 2 + Stage 4 input). After scoring, invokes the governance policy to compute `required_validations`. `voting_service.py` — manages reviewer votes, enforces eligibility, and evaluates thresholds for automated finalization. `governance_service.py` — queries eligible tasks for a given trust level using the project's governance policy. `webhook_service.py` — ensures guaranteed delivery of state-change notifications. |
 | **Rule** | May depend on `scoring/`, `governance/`, `models/`, `schemas/`, `core/`; must **not** depend on `api/`. Services raise domain exceptions from `core/exceptions.py` — never `fastapi.HTTPException`. |
 
 ### `app/registry/` — Registry Domain (Project Composer)

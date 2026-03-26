@@ -195,7 +195,7 @@ flowchart LR
 
 ### R9 — Missing Finalization Signal
 
-**The risk:** The client (Laravel) fails to send the `PATCH /submissions/{id}/final-status` signal after expert/community review. Without this signal, the submission remains `pending_finalization` indefinitely, and the Trust Advisor never computes a `trust_adjustment`.
+**The risk:** The client (Laravel) fails to send sufficient votes to reach the governance threshold. Without reaching the threshold, the submission remains `pending_review` indefinitely, and the Trust Advisor never computes a `trust_adjustment`.
 
 **Impact:** Winnow's user reliability metrics (approval rate, streaks) become incomplete, degrading the quality of future trust recommendations.
 
@@ -203,8 +203,8 @@ flowchart LR
 
 | Strategy | Detail |
 |---|---|
-| **Stale-submission monitoring** | A background query (or scheduled task) identifies submissions that have been `pending_finalization` for longer than a configurable threshold (e.g., 7 days). These can be surfaced via a dashboard endpoint or logged as warnings. |
-| **Client reminder** | The `GET /results?status=pending_finalization` endpoint allows the client to query outstanding submissions and prompt reviewers. |
+| **Stale-submission monitoring** | A background query (or scheduled task) identifies submissions that have been `pending_review` for longer than a configurable threshold (e.g., 7 days). These can be surfaced via a dashboard endpoint or logged as warnings. |
+| **Client reminder** | The `GET /results?status=pending_review` endpoint allows the client to query outstanding submissions and prompt reviewers. |
 | **Auto-expiry (future)** | After a configurable period, submissions could be auto-finalized with a "timed_out" status that carries no trust adjustment. This prevents metric pollution. |
 | **Graceful degradation** | The Trust Advisor still functions with partial data — it computes metrics based on whatever finalized submissions exist. Missing finalizations don't block the system. |
 
@@ -261,8 +261,8 @@ flowchart LR
 
 5. **Backward compatibility:** When new rules are added to an existing project, old submissions (scored without those rules) are not re-scored automatically. This is acceptable for the prototype.
 
-6. **Finalization coverage:** For the prototype, it is assumed that most submissions will eventually receive a finalization signal. The Trust Advisor's quality depends on finalization coverage — projects with low finalization rates will have less reliable trust recommendations. See R9.
+6. **Finalization coverage:** For the prototype, it is assumed that most submissions will eventually receive sufficient reviewer votes. The Trust Advisor's quality depends on finalization coverage — projects with low voting rates will have less reliable trust recommendations. See R9.
 
-7. **Governance enforcement:** The `required_validations` (Target State) is advisory metadata. Winnow does not enforce that N validators have reviewed a submission before accepting a finalization signal. The client project is responsible for enforcing its own review workflow before calling `PATCH /final-status`. This keeps Winnow flexible across diverse project workflows.
+7. **Governance enforcement:** The `required_validations` (Target State) is advisory metadata. Winnow does not enforce that N validators have reviewed a submission before accepting a vote or an override. The client project is responsible for enforcing its own review workflow before calling `POST /votes`. This keeps Winnow flexible across diverse project workflows.
 
 8. **Task query trust integrity:** The `GET /tasks/available` endpoint accepts `user_trust` and `user_role` as query parameters (sent by the client). The same manipulation risk as R7 applies — a compromised client could send inflated values. Mitigation is the same: server-to-server API key auth. End users never call Winnow directly.

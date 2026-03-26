@@ -214,8 +214,10 @@ async def process_submission(envelope: SubmissionEnvelope) -> ScoringResultRespo
     #    If this fails, a 422 error is raised immediately. No scoring occurs.
     validated_payload = config.payload_schema.model_validate(envelope.payload)
 
-    # 3. Persist submission (status = "pending_finalization")
-    submission = await persist_submission(envelope, status="pending_finalization")
+    # 3. Auto-supersede: detect triplet collision
+    #    If a prior pending submission for the same triplet exists, we link to it.
+    prev_ledger = await find_triplet_collision(envelope.metadata)
+    supersedes_id = prev_ledger.id if prev_ledger else None
 
     # 4. STAGE 2 + STAGE 4 INPUT — Run scoring pipeline with validated data
     #    The pipeline receives a Pydantic model instance, NOT a raw dict.
@@ -225,7 +227,11 @@ async def process_submission(envelope: SubmissionEnvelope) -> ScoringResultRespo
         context=envelope.user_context,
     )
 
-    # 5. GOVERNANCE — Determine review requirements ("Target State")
+    # 5. Determine initial status based on Confidence Score and project thresholds
+    initial_status = resolve_status(result.total_score, config.thresholds)
+    supersede_reason = "edited" if supersedes_id else None
+
+    # 6. GOVERNANCE — Determine review requirements ("Target State")
     #    The governance policy uses the Confidence Score + project rules
     #    to compute who must review this submission and how many reviewers are needed.
     required_validations = config.governance_policy.determine_requirements(
@@ -233,14 +239,20 @@ async def process_submission(envelope: SubmissionEnvelope) -> ScoringResultRespo
         user_context=envelope.user_context,
     )
 
-    # 6. Persist scoring result + governance metadata (status remains "pending_finalization")
-    #    The submission awaits ground-truth finalization from the client.
-    await persist_result(submission.id, result, required_validations, status="pending_finalization")
-    return build_response(result, required_validations, status="pending_finalization", config.thresholds)
+    # 7. Persist results in the Lifecycle Ledger (append-only)
+    #    INSERT submissions, snapshots, and status_ledger (linking to supersedes_id).
+    await persist_all(
+        submission_id=envelope.metadata.submission_id,
+        status=initial_status,
+        supersedes=supersedes_id,
+        reason=supersede_reason,
+        ...
+    )
+    return build_response(...)
 
 
-async def finalize_submission(submission_id: UUID, final_status: str) -> FinalizationResponse:
-    """Called when the client sends PATCH /submissions/{id}/final-status.
+async def cast_vote(submission_id: UUID, request: VoteRequest) -> VoteResponse:
+    """Called when the client sends POST /submissions/{id}/votes.
     
     The ground-truth decision (approved/rejected by expert/community)
     triggers the Trust Advisor to compute a trust_adjustment delta.
@@ -388,7 +400,15 @@ sequenceDiagram
         Schema-->>API: ValidationError → 422 response
     end
 
-    Service->>DB: Persist Submission (status=pending_finalization)
+    Note over Service,DB: Auto-supersede (Triplet Collision Check)
+    Service->>DB: find_triplet_match(project, entity, measurement)
+    DB-->>Service: prev_submission (if exists)
+    alt prev_submission exists
+        Service->>DB: lock latest ledger entry (FOR UPDATE)
+        alt prev is terminal
+            Service-->>API: ConflictError → 409 response
+        end
+    end
 
     Note over Service,Rule: Stage 2 + Stage 4 input — Scoring (incl. Tₙ from wire)
     Service->>Pipeline: run(validated_payload, user_context)
@@ -398,38 +418,52 @@ sequenceDiagram
     end
     Pipeline-->>Service: ScoringResult(total_score, breakdown[])
 
-    Service->>DB: Persist ScoringResult (status=pending_finalization)
+    Service->>DB: Persist Submission, Snapshots, and StatusLedger (supersedes=prev_ledger_id)
     Service-->>API: ScoringResultResponse
-    API-->>Client: 201 Created {result, status: pending_finalization}
+    API-->>Client: 201 Created {result, status: ...}
+```,search:
 ```
 
-## 4b. Finalization & Trust Advisory — Sequence Diagram
+## 4b. Voting & Auto-Finalization — Sequence Diagram
 
 ```mermaid
 sequenceDiagram
     participant Client as Laravel App
     participant API as FastAPI Endpoint
-    participant Service as ScoringService
+    participant VoteService as VotingService
     participant Advisor as TrustAdvisor
     participant DB as PostgreSQL
+    participant Webhook as WebhookService
 
-    Note over Client: Expert/community makes final decision
-    Client->>API: PATCH /api/v1/submissions/{id}/final-status {final_status: "approved"}
-    API->>Service: finalize(submission_id, final_status)
+    Note over Client: Reviewer casts a vote
+    Client->>API: POST /api/v1/submissions/{id}/votes {vote: "approve", ...}
+    API->>VoteService: cast_vote(submission_id, vote_request)
 
-    Service->>DB: Load submission + scoring result
-    Service->>DB: Update status → "approved" (ground truth)
+    VoteService->>DB: Load submission + governance snapshot
+    VoteService->>DB: INSERT submission_votes
+    VoteService->>VoteService: Tally active votes vs. threshold
 
-    Note over Service,Advisor: Stage 4 output — Trust Evaluation & Advisory
-    Service->>DB: Query user’s submission history (approval rate, streaks)
-    DB-->>Service: UserSubmissionStats
-    Service->>Advisor: compute_adjustment(user_id, final_status, user_stats)
-    Advisor-->>Service: TrustAdjustment(delta: +2, reason: "...")
+    alt Threshold NOT met
+        VoteService-->>API: VoteResponse {threshold_met: false}
+        API-->>Client: 201 Created
+    else Threshold MET → Auto-Finalize
+        VoteService->>DB: INSERT status_ledger (status: "approved")
+        
+        Note over VoteService,Advisor: Stage 4 output — Trust Evaluation & Advisory
+        VoteService->>DB: Query user’s history via StatusLedger
+        VoteService->>Advisor: compute_adjustment(...)
+        Advisor-->>VoteService: TrustAdjustment(delta: +2)
+        
+        VoteService->>DB: UPDATE status_ledger SET trust_delta = +2
+        VoteService->>DB: INSERT webhook_outbox
+        
+        VoteService-->>API: VoteResponse {threshold_met: true, final_status: "approved"}
+        API-->>Client: 201 Created {final_status, trust_adjustment}
+    end
 
-    Service->>DB: Persist trust_adjustment alongside finalized result
-    Service-->>API: FinalizationResponse
-    API-->>Client: 200 OK {final_status, trust_adjustment}
-    Note over Client: Laravel applies trust delta to users.trust_level
+    Note over Webhook,Client: Async Delivery (Rule 11)
+    Webhook->>DB: Poll outbox
+    Webhook->>Client: POST {webhook_url} {event: "submission.finalized"}
 ```
 
 ---
@@ -440,15 +474,18 @@ Submissions move through a defined lifecycle:
 
 ```mermaid
 stateDiagram-v2
-    [*] --> pending_finalization: POST /submissions (Stages 1→2→4-input)
-    pending_finalization --> approved: PATCH /final-status (expert/community)
-    pending_finalization --> rejected: PATCH /final-status (expert/community)
+    [*] --> pending_review: POST /submissions (Stages 1→2→4-input)
+    pending_review --> approved: POST /votes (Threshold Met)
+    pending_review --> rejected: POST /votes (Threshold Met)
+    pending_review --> voided: PATCH /withdraw
+    pending_review --> pending_review: POST /submissions (Auto-supersede / Edit)
     approved --> [*]
     rejected --> [*]
+    voided --> [*]
 
-    note right of pending_finalization: Confidence Score computed.\nAwaiting ground-truth decision.
+    note right of pending_review: Confidence Score computed.\nAwaiting reviewer votes.\nMay be superseded by a new submission.
+```,search:
     note right of approved: Trust Advisor computes\ntrust_adjustment delta.
-    note right of rejected: Trust Advisor computes\ntrust_adjustment delta.
 ```
 
 ### Confidence Score Thresholds (Advisory)
@@ -513,10 +550,10 @@ The **Task Orchestration Pattern** positions Winnow as the authoritative **Gover
 
 class RequiredValidations(BaseModel):
     """The 'Target State' — what must happen before this submission can be finalized."""
-    min_validators: int            # e.g., 1, 2, 3
-    required_min_trust: int        # minimum trust level for eligible reviewers
-    required_role: str | None      # e.g., "expert", None = any role
-    review_tier: str               # e.g., "auto_approve", "peer_review", "expert_review"
+    threshold_score: int         # minimum accumulated role-weight to finalise
+    role_weights: dict[str, int] # role -> weight contribution per vote
+    required_min_trust: int      # minimum trust level for eligible reviewers
+    review_tier: str             # e.g., "peer_review", "community_review"
 
 
 class GovernancePolicy(ABC):
@@ -554,18 +591,18 @@ class TreeGovernancePolicy(GovernancePolicy):
     def determine_requirements(self, confidence_score, user_context):
         if confidence_score >= 90:
             return RequiredValidations(
-                min_validators=1, required_min_trust=3,
-                required_role=None, review_tier="peer_review"
+                threshold_score=1, role_weights={"citizen": 1, "expert": 1},
+                required_min_trust=30, review_tier="peer_review"
             )
         elif confidence_score >= 50:
             return RequiredValidations(
-                min_validators=2, required_min_trust=5,
-                required_role=None, review_tier="community_review"
+                threshold_score=2, role_weights={"citizen": 1, "expert": 2},
+                required_min_trust=50, review_tier="community_review"
             )
         else:  # score < 50
             return RequiredValidations(
-                min_validators=1, required_min_trust=7,
-                required_role="expert", review_tier="expert_review"
+                threshold_score=2, role_weights={"expert": 2},
+                required_min_trust=70, review_tier="expert_review"
             )
 ```
 
@@ -582,7 +619,7 @@ sequenceDiagram
     Laravel->>API: GET /api/v1/tasks/available?project_id=tree-app&user_trust=5&user_role=trusted
     API->>GovService: get_available_tasks(project_id, user_trust=5, user_role="trusted")
 
-    GovService->>DB: Query submissions WHERE status="pending_finalization"
+    GovService->>DB: Query submissions WHERE status="pending_review"
     DB-->>GovService: [submissions with required_validations]
 
     GovService->>GovService: Filter: for each submission,<br/>policy.is_eligible_reviewer(score, requirements, trust=5, role="trusted")
@@ -667,12 +704,12 @@ Laravel                          Winnow
   │                                │
   │  POST /submissions {envelope}  │
   │ ─────────────────────────────► │  → Stage 1 → Stage 2 → Tₙ input
-  │  ◄───────────────────────────  │  ← 201 {score, status: pending_finalization}
+  │  ◄───────────────────────────  │  ← 201 {score, status: pending_review}
   │                                │
   │  (expert reviews data)         │
   │                                │
-  │  PATCH /submissions/{id}/      │
-  │    final-status {approved}     │
+  │  POST /submissions/{id}/votes  │
+  │    {vote: "approve"}           │
   │ ─────────────────────────────► │  → Stage 4 output: Trust Advisor
   │  ◄───────────────────────────  │  ← 200 {trust_adjustment: {delta: +2, reason: "..."}}
   │                                │

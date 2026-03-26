@@ -226,7 +226,11 @@ Content-Type: application/json
 {
   "submission_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "project_id": "tree-app",
-  "status": "pending_finalization",
+  "entity_type": "tree",
+  "entity_id": "b8f9e0d1-2a3b-4c5d-6e7f-8a9b0c1d2e3f",
+  "measurement_id": "c1d2e3f4-5a6b-7c8d-9e0f-1a2b3c4d5e6f",
+  "ledger_entry_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+  "status": "pending_review",
   "confidence_score": 67.5,
   "breakdown": [
     {
@@ -249,37 +253,30 @@ Content-Type: application/json
       "score": 0.30,
       "weighted_score": 7.5,
       "details": "Trust level 3/10 (Stage 4 input: from wire)"
-    },
-    {
-      "rule": "comment_factor",
-      "weight": 0.05,
-      "score": 1.00,
-      "weighted_score": 5.0,
-      "details": "No comment present — no penalty"
-    },
-    {
-      "rule": "plausibility_factor",
-      "weight": 0.30,
-      "score": 0.60,
-      "weighted_score": 18.0,
-      "details": "Height deviates ~1.2σ from species average"
     }
   ],
-  "required_validations": {
-    "threshold_score": 2,
-    "role_weights": {"citizen": 1, "expert": 2},
-    "required_min_trust": 5,
-    "review_tier": "community_review"
-  },
+  "required_validations": [
+    {
+      "threshold_score": 2,
+      "role_configs": {
+        "citizen": {"weight": 1, "min_trust": 0},
+        "expert": {"weight": 2, "min_trust": 0}
+      },
+      "default_config": {"weight": 1, "min_trust": 50},
+      "blocked_roles": ["guest"],
+      "review_tier": "community_review"
+    }
+  ],
   "thresholds": {
     "auto_approve_min": 80,
     "manual_review_min": 50
   },
+  "votes": [],
   "created_at": "2026-03-10T17:30:01Z"
 }
 ```
 
-> **Note:** The initial response always returns `status: "pending_finalization"`. The Confidence Score, thresholds, and `required_validations` are provided so the client has **immediate metadata for its UI**. The `required_validations` object defines the "Target State" — how many validators are needed, what minimum trust level they require, and whether a specific role (e.g., expert) is mandatory. The client renders its review queue and permissions accordingly. The definitive status is set by the finalization signal.
+> **Note:** The initial response returns `status: "pending_review"` (or auto-finalized `approved`/`rejected`). The Confidence Score, thresholds, and `required_validations` are provided so the client has **immediate metadata for its UI**. The `required_validations` list defines the tiers of review needed — how many role-weighted points are needed, and what minimum trust level they require. The client renders its review queue and permissions accordingly.
 >
 > **Threshold design — 2 boundaries, not 3:** The `thresholds` object intentionally contains only two integer fields. Dividing a 0-100 integer scale into three contiguous routing regions requires exactly 2 boundaries. A third `reject` field would be arithmetically redundant (`reject_max = manual_review_min - 1`) and would open the door to configuration gaps (scores that fall into no region) or overlaps (ambiguous routing). The auto-reject region is **implicit**: any score below `manual_review_min` is auto-rejected by the client without Winnow needing to declare an explicit lower bound. See `02_architecture_patterns.md §5` for the full rationale.
 
@@ -303,112 +300,54 @@ class ThresholdConfig(BaseModel):
     # Cross-field invariant enforced by @model_validator(mode="after"):
     # auto_approve_min >= manual_review_min
 
+class RoleConfig(BaseModel):
+    weight: int = Field(ge=0)
+    min_trust: int = Field(ge=0)
+
 class RequiredValidations(BaseModel):
-    # Role-weights pattern (Sprint 2.5 Task 2 — Dynamic Governance):
-    # threshold_score replaces min_validators; role_weights replaces required_role.
-    # The voting service sums role_weights[voter_role] for each eligible vote;
-    # finalisation triggers when approve_sum or reject_sum >= threshold_score.
-    # Example — "2 citizens OR 1 expert": threshold_score=2, role_weights={"citizen":1,"expert":2}
     threshold_score: int         # minimum accumulated role-weight to finalise
-    role_weights: dict[str, int] # role → weight contribution per vote (absent/0 = ineligible)
-    required_min_trust: int      # minimum trust level for eligible reviewers
-    review_tier: str             # e.g., "peer_review", "community_review", "expert_review"
+    role_configs: dict[str, RoleConfig] # role -> weight & min_trust map
+    default_config: RoleConfig | None   # fallback for unlisted roles
+    blocked_roles: list[str]     # roles explicitly barred from voting
+    review_tier: str             # e.g., "community_review"
 
 class ScoringResultResponse(BaseModel):
     submission_id: UUID
     project_id: str
-    status: Literal["pending_finalization", "approved", "rejected"]
+    entity_type: str
+    entity_id: UUID
+    measurement_id: UUID
+    ledger_entry_id: UUID
+    status: Literal["pending_review", "approved", "rejected", "voided"]
+    supersedes: UUID | None = None
+    supersede_reason: str | None = None
+    trust_delta: int = 0
     confidence_score: float = Field(ge=0.0, le=100.0)  # 0–100
     breakdown: list[RuleBreakdown]
-    required_validations: RequiredValidations
+    required_validations: list[RequiredValidations]
     thresholds: ThresholdConfig
+    votes: list[ActiveVoteItem]
     created_at: AwareDatetime             # timezone-aware ISO-8601 timestamp
 ```
 
 ---
 
-## 3b. Supersede Request & Response
+## 3b. Automatic Superseding (Triplet Collisions)
 
-> **Sprint 2.5 pivot:** The old `PATCH /final-status` accepting `approved`/`rejected` has been
-> **replaced**. `approved`/`rejected` transitions now happen automatically when the Governance
-> Engine's vote-threshold is met (see §9). The only remaining client-initiated status transition
-> is marking a submission as `superseded` when the user corrects their data.
+Winnow enforces the **Immutable Submissions** principle (Rule 10). When a user corrects their data in the client system, the client sends a brand-new submission. 
 
-When a user corrects domain data in the client, the client sends a brand-new submission (new UUID)
-and then calls this endpoint to retire the old one. This preserves a complete audit trail without
-mutating any existing record (Rule 10 — Immutable Submissions & Append-Only State).
+If Winnow detects a new submission for the same **(project_id, entity_id, measurement_id)** triplet while a prior submission is still `pending_review`, it **automatically supersedes** the prior one.
 
-### Endpoint
+- The new submission's first ledger entry carries a `supersedes` pointer to the old submission's latest ledger entry.
+- The `supersede_reason` is set to `"edited"`.
+- The old submission remains in its last state but is shadowed by the new one in the results lineage.
+- If the prior submission is already in a **terminal state** (`approved`, `rejected`, or `voided`), Winnow rejects the new submission with a `409 Conflict` error.
 
-```
-PATCH /api/v1/submissions/{submission_id}/supersede
-Content-Type: application/json
-```
+This process ensures that corrections are tracked without mutating existing audit logs, maintaining a single, unbroken chain of truth for every measurement event.
 
-### Request Body
+---
 
-```json
-{
-  "status": "superseded",
-  "superseded_by": "new-submission-uuid"
-}
-```
-
-### Request Schema (Conceptual)
-
-```python
-# app/schemas/supersede.py
-
-class SupersedeRequest(BaseModel):
-    status: Literal["superseded"]   # ONLY "superseded" accepted — schema rejects any other value
-    superseded_by: UUID              # UUID of the replacement submission
-```
-
-> **Enforcement:** `status` is a `Literal["superseded"]` — Pydantic rejects `"approved"` or
-> `"rejected"` with a 422, preventing accidental misuse of this endpoint to bypass the
-> Governance Engine's automated finalization logic.
-
-### Response (200 OK)
-
-```json
-{
-  "submission_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-  "final_status": "approved",
-  "confidence_score": 67.5,
-  "trust_adjustment": {
-    "user_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
-    "recommended_delta": 2,
-    "reason": "5 consecutive approved submissions (streak bonus)",
-    "current_trust_level": 3,
-    "project_min_trust": 0,
-    "project_max_trust": 500
-  },
-  "finalized_at": "2026-03-11T09:15:00Z"
-}
-```
-
-### Response Schema (Conceptual)
-
-```python
-# app/schemas/finalization.py  (conceptual)
-
-class TrustAdjustment(BaseModel):
-    user_id: UUID
-    recommended_delta: int               # positive = reward, negative = penalty
-    reason: str
-    current_trust_level: int             # as received on the wire at submission time
-    project_min_trust: int               # project-configured minimum trust value
-    project_max_trust: int               # project-configured maximum trust value
-
-class FinalizationResponse(BaseModel):
-    submission_id: UUID
-    final_status: Literal["approved", "rejected"]
-    confidence_score: float              # original score for reference
-    trust_adjustment: TrustAdjustment
-    finalized_at: AwareDatetime          # timezone-aware ISO-8601 timestamp
-```
-
-> **Important:** The `trust_adjustment` is a **recommendation**. Laravel receives it and decides whether to apply it to `users.trust_level`. Winnow never directly modifies the client’s user data.
+> **Important:** Trust adjustments (deltas) are now delivered exclusively via the `trust_delta` field in the webhook payload (Section 10) or by querying the `status_ledger` via the results endpoint. The client (Laravel) receives the delta and applies it atomically to `users.trust_level`.
 
 
 > **Race-condition safeguard:** The `TrustAdjustment` response deliberately omits a `recommended_new_level` field. Returning a pre-computed new level would tempt the client to blindly overwrite its DB value, causing race conditions when parallel submissions produce concurrent deltas. The client **MUST** apply only the `recommended_delta` atomically, using the returned bounds to clamp the result (e.g., `UPDATE users SET trust_level = CLAMP(trust_level + delta, project_min_trust, project_max_trust) WHERE id = ?`). The trust scale boundaries (`project_min_trust`, `project_max_trust`) are project-specific and configured in the Winnow registry.
@@ -482,9 +421,17 @@ sequenceDiagram
         Winnow-->>Laravel: 422 {validation errors}
     end
 
+    Note over Winnow: Triplet Collision Check (Auto-supersede)
+    Winnow->>WinnowDB: Find existing submission for triplet
+    alt Already terminal
+        Winnow-->>Laravel: 409 Conflict
+    else Still pending
+        Winnow->>Winnow: Link to prior ledger entry (supersedes FK)
+    end
+
     Note over Winnow: Stage 2 + Stage 4 input — Scoring (Hₙ, Aₙ, Pₙ, Kₙ, Tₙ)
-    Winnow->>WinnowDB: Persist submission + scoring result (pending_finalization)
-    Winnow-->>Laravel: 201 {confidence_score, breakdown, required_validations, status: pending_finalization}
+    Winnow->>WinnowDB: Persist submission + snapshots + status_ledger
+    Winnow-->>Laravel: 201 {confidence_score, breakdown, required_validations, status, supersedes}
     Laravel->>Laravel: Route based on score + required_validations (render review queue)
     Laravel-->>User: Show preliminary result in UI
     end
@@ -508,7 +455,7 @@ sequenceDiagram
     Note over User,WinnowDB: Phase 3 — Task Query (Governance)
     User->>Laravel: Open "Review Queue" page
     Laravel->>Winnow: GET /api/v1/tasks/available?project_id=tree-app&user_trust=5&user_role=trusted
-    Winnow->>WinnowDB: Query pending_finalization submissions
+    Winnow->>WinnowDB: Query pending_review submissions
     Winnow->>Winnow: Apply governance policy (filter by eligibility)
     Winnow-->>Laravel: 200 {tasks: [{submission_id, score, review_tier, ...}]}
     Laravel-->>User: Render eligible review tasks
@@ -619,7 +566,7 @@ Returns the `ScoringResultResponse` schema (including `required_validations`) fo
 ### List Endpoint (optional, for dashboards)
 
 ```
-GET /api/v1/results?project_id=tree-app&status=pending_finalization&page=1&per_page=20
+GET /api/v1/results?project_id=tree-app&status=pending_review&page=1&per_page=20
 ```
 
 ---
@@ -791,25 +738,11 @@ ELSE:
 > The "OR" logic is expressed **entirely through the registry configuration** (role_weights values)
 > — no conditional branches in the service layer whatsoever.
 
-### 9.3 Superseded Status — Dedicated Endpoint
+### 9.3 Superseded Status — Handled Automatically
 
-The old `PATCH /final-status` route has been **renamed and narrowed** to `PATCH /supersede`
-(see §3b). The client (Laravel) uses it when a user corrects data and a new submission replaces
-the old one. Voting-driven finalisation (`approved`/`rejected`) is handled entirely by the voting
-endpoint — the client **never** sends these statuses directly.
+The old `PATCH /final-status` and `PATCH /supersede` routes have been **removed**. The client (Laravel) no longer needs to explicitly mark a submission as superseded. Instead, Winnow handles this automatically during `POST /submissions` if a triplet collision is detected (see §3b).
 
-```
-PATCH /api/v1/submissions/{submission_id}/supersede
-Content-Type: application/json
-
-{
-  "status": "superseded",
-  "superseded_by": "new-submission-uuid"
-}
-```
-
-> **Schema guard:** `status` is `Literal["superseded"]` — the Pydantic schema rejects any other
-> value with 422, making it impossible to accidentally approve or reject via this endpoint.
+Voting-driven finalisation (`approved`/`rejected`) remains the primary way to reach a terminal state via the voting endpoint.
 
 ---
 
@@ -817,39 +750,30 @@ Content-Type: application/json
 
 When Winnow automatically transitions a submission to a terminal state (`approved` or `rejected`) via vote threshold evaluation, it notifies the client (Laravel) asynchronously via an HTTP webhook callback.
 
-### 10.1 Webhook Payload
+### 10.1 Webhook Payload (StatusLedgerWebhookPayload)
 
 ```
 POST {client_webhook_url}
 Content-Type: application/json
-X-Winnow-Event: submission.finalized
+X-Winnow-Event: submission.approved
 X-Winnow-Delivery: "unique-delivery-uuid"
 ```
 
 ```json
 {
-  "event": "submission.finalized",
-  "delivery_id": "unique-delivery-uuid",
-  "timestamp": "2026-03-11T09:15:00Z",
-  "payload": {
-    "submission_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-    "project_id": "tree-app",
-    "final_status": "approved",
-    "confidence_score": 67.5,
-    "trust_adjustment": {
-      "user_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
-      "recommended_delta": 2,
-      "reason": "Submission approved",
-      "current_trust_level": 50,
-      "project_min_trust": 0,
-      "project_max_trust": 100
-    },
-    "vote_summary": {
-      "approve": 2,
-      "reject": 0,
-      "total": 2
-    }
-  }
+  "event_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+  "event_type": "submission.approved",
+  "occurred_at": "2026-03-11T09:15:00Z",
+  "project_id": "tree-app",
+  "submission_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "entity_type": "tree",
+  "entity_id": "b8f9e0d1-2a3b-4c5d-6e7f-8a9b0c1d2e3f",
+  "measurement_id": "c1d2e3f4-5a6b-7c8d-9e0f-1a2b3c4d5e6f",
+  "new_status": "approved",
+  "supersedes": "e4f5a6b7-c8d9-0e1f-2a3b-4c5d6e7f8a9b",
+  "supersede_reason": "voting_concluded",
+  "trust_delta": 2,
+  "confidence_score": 67.5
 }
 ```
 
