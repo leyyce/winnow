@@ -33,14 +33,12 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import NotEligibleError
+from app.governance.base import GovernancePolicy
 from app.models.scoring_snapshot import ScoringSnapshot
 from app.models.status_ledger import StatusLedger, StatusLedgerStatus
 from app.models.submission import Submission
-from app.models.submission_vote import SubmissionVote
-from app.registry.manager import registry
 from app.schemas.results import RequiredValidations
 from app.schemas.tasks import TaskItem, TaskListResponse
-from app.schemas.voting import ActiveVoteItem
 from app.services.scoring_service import _get_active_votes
 
 logger = logging.getLogger(__name__)
@@ -68,7 +66,6 @@ async def get_available_tasks(
     5. Populate ``active_votes`` for each eligible task.
     6. Paginate and return ``TaskListResponse``.
     """
-    config = registry.get_config(project_id)
 
     # Subquery: latest status_ledger created_at per submission
     latest_ledger_subq = (
@@ -132,7 +129,7 @@ async def get_available_tasks(
         eligible_in_any = False
         for tier in all_tiers:
             try:
-                config.governance_policy.get_vote_weight(tier, user_role, user_trust)
+                GovernancePolicy.get_vote_weight(tier, user_role, user_trust)
                 eligible_in_any = True
                 break
             except NotEligibleError:

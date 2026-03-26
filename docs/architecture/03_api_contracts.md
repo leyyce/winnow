@@ -36,7 +36,7 @@ Content-Type: application/json
   "metadata": {
     "project_id": "tree-app",
     "submission_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-    "submission_type": "tree_measurement",
+    "submission_type": "tree",
     "submitted_at": "2026-03-10T17:30:00Z",
     "client_version": "1.2.0"
   },
@@ -123,7 +123,7 @@ graph TD
 class SubmissionMetadata(BaseModel):
     project_id: str                       # e.g. "tree-app"
     submission_id: UUID
-    submission_type: str                  # e.g. "tree_measurement", "tree_registration"
+    submission_type: str                  # e.g. "tree", "shrub"
     submitted_at: AwareDatetime           # timezone-aware ISO-8601 timestamp (required)
     client_version: str | None = None
 
@@ -547,7 +547,7 @@ GET /api/v1/tasks/available?project_id=tree-app&user_trust=5&user_role=trusted
     {
       "submission_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
       "project_id": "tree-app",
-      "submission_type": "tree_measurement",
+      "submission_type": "tree",
       "confidence_score": 67.5,
       "review_tier": "community_review",
       "required_validations": {
@@ -561,7 +561,7 @@ GET /api/v1/tasks/available?project_id=tree-app&user_trust=5&user_role=trusted
     {
       "submission_id": "b2c3d4e5-f6a7-8901-bcde-f12345678901",
       "project_id": "tree-app",
-      "submission_type": "tree_measurement",
+      "submission_type": "tree",
       "confidence_score": 42.0,
       "review_tier": "expert_review",
       "required_validations": {
@@ -632,7 +632,7 @@ GET /api/v1/results?project_id=tree-app&status=pending_finalization&page=1&per_p
 
 2. **Photo handling:** Winnow does **not** receive raw image files. The Laravel app uploads photos to its own storage; only URLs are passed in the payload. Future ML-based image validation could fetch images on demand.
 
-3. **Submission types:** The `submission_type` field (e.g., `tree_measurement` vs. `tree_registration`) allows different validation rule sets within the same project. For the tree-app prototype, `tree_measurement` is the primary type.
+3. **Submission types:** The `submission_type` field (e.g., `tree` vs. `shrub`) allows different validation rule sets within the same project. For the tree-app prototype, `tree` is the primary type.
 
 4. **Species reference data:** The allometric coefficients (`a`–`g`) from `tree_species` are sent in the payload so Winnow can compute plausibility without accessing the Laravel database. If this data rarely changes, a caching mechanism on Winnow's side could be considered.
 

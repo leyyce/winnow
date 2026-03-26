@@ -134,7 +134,6 @@ def _ctx(trust_level: int = 50) -> UserContext:
         username="tester",
         role="citizen",
         trust_level=trust_level,
-        total_submissions=5,
         account_created_at=_FIXED_TS,
     )
 

@@ -60,7 +60,7 @@ Realign the Winnow architecture to enforce a strict separation between **immutab
 - Added `valid_entity_types: list[str]` to `ProjectRegistryEntry` with `__post_init__` guard
 
 **`app/registry/projects/trees.py`**
-- Added `valid_entity_types=["tree_measurement"]` to `TreeProjectBuilder`
+- Added `valid_entity_types=["tree"]` to `TreeProjectBuilder`
 
 **`app/core/exceptions.py`**
 - Added `InvalidEntityTypeError` → mapped to HTTP 422 at API layer

@@ -93,5 +93,5 @@ async def override_submission(
     The ``request.is_override`` flag must be ``True``; if not, this endpoint
     behaves as a regular vote cast (eligibility rules apply).
     """
-    await voting_service.cast_vote(submission_id, request, db)
+    await voting_service.cast_vote(submission_id, request, db, is_override=True)
     return await scoring_service.get_submission_result(submission_id, db)

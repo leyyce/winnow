@@ -298,8 +298,8 @@ class TestTreeProjectBuilderGovernance:
 
     def test_all_tiers_have_positive_threshold_score(self):
         for tier in self.policy._tiers:
-            assert tier.threshold_score >= 1, (
-                f"Tier '{tier.review_tier}' has invalid threshold_score={tier.threshold_score}"
+            assert tier.vote_threshold >= 1, (
+                f"Tier '{tier.review_tier}' has invalid threshold_score={tier.vote_threshold}"
             )
 
     def test_all_tiers_have_role_configs_dict(self):
@@ -318,13 +318,13 @@ class TestTreeProjectBuilderGovernance:
                     f"Tier '{tier.review_tier}' role '{role}' min_trust is negative"
                 )
 
-    def test_all_tiers_have_valid_default_config(self):
+    def test_all_tiers_have_valid_default_config_or_none(self):
         for tier in self.policy._tiers:
-            assert tier.default_config.weight >= 0
-            assert tier.default_config.min_trust >= 0
+            assert not tier.default_config or tier.default_config.weight >= 0
+            assert not tier.default_config or tier.default_config.min_trust >= 0
 
     def test_tiers_sorted_descending_by_score_threshold(self):
-        thresholds = [t.score_threshold for t in self.policy._tiers]
+        thresholds = [t.confidence_threshold for t in self.policy._tiers]
         assert thresholds == sorted(thresholds, reverse=True)
 
     def test_expert_review_tier_excludes_citizen(self):

@@ -117,7 +117,7 @@ class RequiredValidations(BaseModel):
             "specific config; roles absent fall back to default_config."
         ),
     )
-    default_config: RoleConfig = Field(
+    default_config: RoleConfig | None = Field(
         description=(
             "Fallback config for roles not listed in role_configs.  "
             "Applied to any role not in role_configs and not in blocked_roles."
@@ -168,9 +168,15 @@ class ScoringResultResponse(BaseModel):
 
     submission_id: UUID = Field(description="Echo of the client-supplied submission UUID.")
     project_id: str = Field(min_length=1, description="Project this submission belongs to.")
-    entity_type: str = Field(description="Entity type, e.g. 'tree_measurement'.")
+    entity_type: str = Field(description="Entity type, e.g. 'tree'.")
     entity_id: UUID = Field(description="Domain entity UUID (part of identity triplet).")
     measurement_id: UUID = Field(description="Measurement event UUID (part of identity triplet).")
+    ledger_entry_id: UUID = Field(
+        description="UUID of the active StatusLedger entry this response reflects.",
+    )
+    created_at: AwareDatetime = Field(
+        description="ISO-8601 timestamp when this submission was first persisted.",
+    )
     status: Literal["pending_review", "approved", "rejected", "voided"] = Field(
         description=(
             "Current lifecycle state from the latest StatusLedger row. "
@@ -178,6 +184,10 @@ class ScoringResultResponse(BaseModel):
             "'approved'/'rejected' = terminal states. "
             "'voided' = withdrawn, edited, or admin-overridden to void."
         ),
+    )
+    supersedes: UUID | None = Field(
+        default=None,
+        description="ID of the ledger entry this row replaces (backward pointer).",
     )
     supersede_reason: str | None = Field(
         default=None,
@@ -209,10 +219,4 @@ class ScoringResultResponse(BaseModel):
         default_factory=list,
         serialization_alias="votes",
         description="Latest resolved vote per reviewer (append-only latest-wins).",
-    )
-    ledger_entry_id: UUID = Field(
-        description="UUID of the active StatusLedger entry this response reflects.",
-    )
-    created_at: AwareDatetime = Field(
-        description="ISO-8601 timestamp when this submission was first persisted.",
     )

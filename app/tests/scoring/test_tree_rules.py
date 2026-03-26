@@ -287,8 +287,8 @@ class TestTreeGovernancePolicy:
         BLOCKED = ["guest", "banned"]
         self.policy = GovernancePolicy(tiers=[
             GovernanceTier(
-                score_threshold=80.0, review_tier="peer_review",
-                threshold_score=1,
+                confidence_threshold=80.0, review_tier="peer_review",
+                vote_threshold=1,
                 role_configs={
                     "citizen": RoleConfig(weight=1, min_trust=30),
                     "expert": RoleConfig(weight=1, min_trust=0),
@@ -297,8 +297,8 @@ class TestTreeGovernancePolicy:
                 blocked_roles=BLOCKED,
             ),
             GovernanceTier(
-                score_threshold=50.0, review_tier="community_review",
-                threshold_score=2,
+                confidence_threshold=50.0, review_tier="community_review",
+                vote_threshold=2,
                 role_configs={
                     "citizen": RoleConfig(weight=1, min_trust=50),
                     "expert": RoleConfig(weight=2, min_trust=0),
@@ -307,8 +307,8 @@ class TestTreeGovernancePolicy:
                 blocked_roles=BLOCKED,
             ),
             GovernanceTier(
-                score_threshold=0.0, review_tier="expert_review",
-                threshold_score=3,
+                confidence_threshold=0.0, review_tier="expert_review",
+                vote_threshold=3,
                 role_configs={
                     "expert": RoleConfig(weight=3, min_trust=75),
                 },
@@ -348,14 +348,14 @@ class TestTreeGovernancePolicy:
         # Pass tiers in wrong order — policy must sort them descending
         policy = GovernancePolicy(tiers=[
             GovernanceTier(
-                score_threshold=0.0, review_tier="expert_review",
-                threshold_score=3,
+                confidence_threshold=0.0, review_tier="expert_review",
+                vote_threshold=3,
                 role_configs={"expert": RoleConfig(weight=3, min_trust=75)},
                 default_config=RoleConfig(weight=0, min_trust=9999),
             ),
             GovernanceTier(
-                score_threshold=80.0, review_tier="peer_review",
-                threshold_score=1,
+                confidence_threshold=80.0, review_tier="peer_review",
+                vote_threshold=1,
                 role_configs={"citizen": RoleConfig(weight=1, min_trust=30)},
                 default_config=RoleConfig(weight=1, min_trust=30),
             ),
@@ -396,14 +396,14 @@ class TestTreeGovernancePolicy:
         # citizen weight=1, min_trust=30 → eligible at trust=30
         req = _req(role_configs={"citizen": {"weight": 1, "min_trust": 30},
                                   "expert": {"weight": 1, "min_trust": 0}})
-        weight = self.policy.get_vote_weight(req, "citizen", 30)
+        weight = GovernancePolicy.get_vote_weight(req, "citizen", 30)
         assert weight == 1
 
     def test_ineligible_reviewer_fails_trust(self):
         req = _req(role_configs={"citizen": {"weight": 1, "min_trust": 30},
                                   "expert": {"weight": 1, "min_trust": 0}})
         with pytest.raises(NotEligibleError):
-            self.policy.get_vote_weight(req, "citizen", 29)
+            GovernancePolicy.get_vote_weight(req, "citizen", 29)
 
     def test_ineligible_reviewer_role_not_in_weights(self):
         # expert_review: citizen absent → falls to default_config weight=0 → ineligible
@@ -412,21 +412,21 @@ class TestTreeGovernancePolicy:
                    default_config={"weight": 0, "min_trust": 9999},
                    review_tier="expert_review")
         with pytest.raises(NotEligibleError):
-            self.policy.get_vote_weight(req, "citizen", 80)
+            GovernancePolicy.get_vote_weight(req, "citizen", 80)
 
     def test_ineligible_reviewer_role_has_zero_weight(self):
         # Explicitly zero weight → ineligible even with sufficient trust
         req = _req(role_configs={"citizen": {"weight": 0, "min_trust": 0},
                                   "expert": {"weight": 3, "min_trust": 0}})
         with pytest.raises(NotEligibleError):
-            self.policy.get_vote_weight(req, "citizen", 80)
+            GovernancePolicy.get_vote_weight(req, "citizen", 80)
 
     def test_eligible_expert_reviewer_in_expert_review(self):
         req = _req(threshold_score=3,
                    role_configs={"expert": {"weight": 3, "min_trust": 75}},
                    default_config={"weight": 0, "min_trust": 9999},
                    review_tier="expert_review")
-        weight = self.policy.get_vote_weight(req, "expert", 75)
+        weight = GovernancePolicy.get_vote_weight(req, "expert", 75)
         assert weight == 3
 
     def test_ineligible_reviewer_exactly_one_below_min_trust(self):
@@ -434,13 +434,13 @@ class TestTreeGovernancePolicy:
         req = _req(role_configs={"citizen": {"weight": 1, "min_trust": 50},
                                   "expert": {"weight": 2, "min_trust": 0}})
         with pytest.raises(NotEligibleError):
-            self.policy.get_vote_weight(req, "citizen", 49)
+            GovernancePolicy.get_vote_weight(req, "citizen", 49)
 
     def test_eligible_reviewer_exactly_at_min_trust(self):
         # Boundary: trust=50 == min_trust=50 → eligible
         req = _req(role_configs={"citizen": {"weight": 1, "min_trust": 50},
                                   "expert": {"weight": 2, "min_trust": 0}})
-        weight = self.policy.get_vote_weight(req, "citizen", 50)
+        weight = GovernancePolicy.get_vote_weight(req, "citizen", 50)
         assert weight == 1
 
     def test_unknown_role_falls_to_default_config(self):
@@ -448,20 +448,20 @@ class TestTreeGovernancePolicy:
         req = _req(role_configs={"citizen": {"weight": 1, "min_trust": 0},
                                   "expert": {"weight": 2, "min_trust": 0}},
                    default_config={"weight": 1, "min_trust": 25})
-        weight = self.policy.get_vote_weight(req, "moderator", 25)
+        weight = GovernancePolicy.get_vote_weight(req, "moderator", 25)
         assert weight == 1
 
     def test_blocked_role_raises_regardless_of_trust(self):
         req = _req(blocked_roles=["guest", "banned"])
         with pytest.raises(NotEligibleError):
-            self.policy.get_vote_weight(req, "guest", 9999)
+            GovernancePolicy.get_vote_weight(req, "guest", 9999)
 
     def test_blocked_role_takes_precedence_over_role_configs(self):
         # Even if 'guest' is in role_configs, blocked_roles wins
         req = _req(role_configs={"guest": {"weight": 5, "min_trust": 0}},
                    blocked_roles=["guest"])
         with pytest.raises(NotEligibleError):
-            self.policy.get_vote_weight(req, "guest", 100)
+            GovernancePolicy.get_vote_weight(req, "guest", 100)
 
 
 # ── ScoringPipeline integration ───────────────────────────────────────────────

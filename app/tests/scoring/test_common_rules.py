@@ -117,7 +117,6 @@ class TestTrustAdvisor:
             penalty_per_rejection=3,
             streak_bonus=2,
             streak_threshold=5,
-            min_trust=0,
             max_trust=100,
         )
         self.advisor = TrustAdvisor(self.config)
@@ -197,12 +196,11 @@ class TestTrustAdvisor:
             penalty_per_rejection=5,
             streak_bonus=3,
             streak_threshold=3,
-            min_trust=10,
             max_trust=200,
         )
         advisor = TrustAdvisor(config)
         result = advisor.compute_adjustment(self.user_id, 50, "approved", _user_stats())
-        assert result.project_min_trust == 10
+        assert result.project_min_trust == 0
         assert result.project_max_trust == 200
 
     def test_reward_and_penalty_from_config_are_applied(self):
@@ -211,7 +209,6 @@ class TestTrustAdvisor:
             penalty_per_rejection=10,
             streak_bonus=0,
             streak_threshold=99,
-            min_trust=0,
             max_trust=100,
         )
         advisor = TrustAdvisor(config)

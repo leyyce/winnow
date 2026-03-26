@@ -37,7 +37,7 @@ class SubmissionMetadata(BaseModel):
     entity_type: str = Field(
         min_length=1,
         description=(
-            "Submission variant within the project, e.g. 'tree_measurement'. "
+            "Submission variant within the project, e.g. 'tree'. "
             "Must match one of the project's configured valid_entity_types."
         ),
     )
@@ -83,10 +83,6 @@ class UserContext(BaseModel):
     trust_level: int = Field(
         ge=0,
         description="Current trust score as known by the client at request time. Scale is project-specific.",
-    )
-    total_submissions: int = Field(
-        ge=0,
-        description="Cumulative submission count for context; must be non-negative.",
     )
     account_created_at: AwareDatetime = Field(
         description="ISO-8601 timestamp of account creation; changes only once.",

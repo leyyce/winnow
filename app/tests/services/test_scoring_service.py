@@ -46,7 +46,7 @@ def _envelope(
         metadata=SubmissionMetadata(
             project_id=project_id,
             submission_id=uuid4(),
-            entity_type="tree_measurement",
+            entity_type="tree",
             entity_id=uuid4(),
             measurement_id=uuid4(),
             submitted_at=datetime(2024, 1, 1, tzinfo=timezone.utc),

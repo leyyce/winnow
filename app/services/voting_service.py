@@ -20,7 +20,7 @@ Sprint 5 (Lifecycle Ledger) rewrite
 
 Admin Override (Power-Vote Pattern)
 ------------------------------------
-When ``request.is_override=True``:
+When ``is_override=True``:
 * Eligibility check is bypassed.
 * The submission is immediately forced into the specified terminal state.
 * ``supersede_reason='admin_overwrite'`` is recorded.
@@ -36,7 +36,7 @@ from __future__ import annotations
 import logging
 from uuid import UUID, uuid4
 
-from sqlalchemy import desc, func, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import (
@@ -44,9 +44,8 @@ from app.core.exceptions import (
     NotEligibleError,
     SubmissionNotFoundError,
 )
-from app.models.scoring_snapshot import ScoringSnapshot
+from app.governance.base import GovernancePolicy
 from app.models.status_ledger import (
-    TERMINAL_STATES,
     StatusLedger,
     StatusLedgerStatus,
     SupersedeReason,
@@ -54,11 +53,9 @@ from app.models.status_ledger import (
 from app.models.submission import Submission
 from app.models.submission_vote import SubmissionVote
 from app.registry.manager import registry
-from app.schemas.results import RequiredValidations, ScoringResultResponse
+from app.schemas.results import RequiredValidations
 from app.schemas.voting import VoteRequest, VoteResponse, VoteTally
-from app.services import webhook_service
 from app.services.scoring_service import (
-    _build_response,
     _enqueue_webhook,
     _latest_ledger_entry,
     _latest_scoring_snapshot,
@@ -104,7 +101,6 @@ async def _latest_vote_per_user(
 def _compute_tally(
     active_votes: list[SubmissionVote],
     requirements: RequiredValidations,
-    governance_policy,
 ) -> tuple[int, int]:
     """
     Compute (approve_weight, reject_weight) from the list of active votes.
@@ -117,7 +113,7 @@ def _compute_tally(
 
     for vote in active_votes:
         try:
-            weight = governance_policy.get_vote_weight(
+            weight = GovernancePolicy.get_vote_weight(
                 requirements,
                 vote.user_role,
                 vote.user_trust_level,
@@ -138,6 +134,7 @@ async def cast_vote(
     submission_id: UUID,
     request: VoteRequest,
     db: AsyncSession,
+    is_override: bool = False,
 ) -> VoteResponse:
     """
     Record a reviewer's vote and evaluate governance thresholds.
@@ -172,7 +169,7 @@ async def cast_vote(
     current_ledger = await _latest_ledger_entry(submission_id, db, for_update=True)
     # Admin overrides may target any status (including terminal states).
     # Normal votes are only permitted when the submission is pending_review.
-    if not request.is_override:
+    if not is_override:
         if current_ledger is None or current_ledger.status != StatusLedgerStatus.PENDING_REVIEW:
             status = getattr(current_ledger, "status", "unknown")
             raise AlreadyFinalizedError(submission_id, status)
@@ -185,15 +182,14 @@ async def cast_vote(
     ]
 
     config = registry.get_config(submission.project_id)
-    governance_policy = config.governance_policy
 
     # Step 3–4 — eligibility check (skipped for admin override)
     # Reviewer is eligible if they qualify in at least one applicable tier.
-    if not request.is_override:
+    if not is_override:
         eligible_in_any = False
         for req in all_requirements:
             try:
-                governance_policy.get_vote_weight(
+                GovernancePolicy.get_vote_weight(
                     req,
                     request.user_role,
                     request.user_trust_level,
@@ -209,7 +205,7 @@ async def cast_vote(
             )
 
     # Validate override vote value
-    if request.is_override and request.vote not in ("approve", "reject", "voided"):
+    if is_override and request.vote not in ("approve", "reject", "voided"):
         raise NotEligibleError("Override vote must be 'approve', 'reject', or 'voided'.")
 
     # Step 5 — INSERT vote (append-only, no duplicate check)
@@ -218,7 +214,7 @@ async def cast_vote(
         submission_id=submission_id,
         user_id=request.user_id,
         vote=request.vote,
-        is_override=request.is_override,
+        is_override=is_override,
         user_trust_level=request.user_trust_level,
         user_role=request.user_role,
         note=request.note,
@@ -227,7 +223,7 @@ async def cast_vote(
     await db.flush()
 
     # ── Admin Override — forced terminal state ────────────────────────────────
-    if request.is_override:
+    if is_override:
         forced_status = _vote_to_status(request.vote)
         # current_ledger may be None for a missing submission with no ledger entries;
         # guard defensively — SubmissionNotFoundError was already raised above.
@@ -286,7 +282,7 @@ async def cast_vote(
     winning_reject = 0
 
     for req in all_requirements:
-        approve_weight, reject_weight = _compute_tally(active_votes, req, governance_policy)
+        approve_weight, reject_weight = _compute_tally(active_votes, req)
         if approve_weight >= req.threshold_score or reject_weight >= req.threshold_score:
             threshold_met = True
             winning_approve = approve_weight
@@ -301,7 +297,7 @@ async def cast_vote(
     # Use first tier's tally for response display when no threshold met
     if not threshold_met:
         winning_approve, winning_reject = _compute_tally(
-            active_votes, all_requirements[0], governance_policy
+            active_votes, all_requirements[0]
         )
 
     tally = VoteTally(approve=winning_approve, reject=winning_reject)

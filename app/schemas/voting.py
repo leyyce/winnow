@@ -62,15 +62,6 @@ class VoteRequest(BaseModel):
         min_length=1,
         description="Reviewer's role in the client system (e.g. 'citizen', 'expert').",
     )
-    is_override: bool = Field(
-        default=False,
-        description=(
-            "Admin-only flag. When True, this vote is a Power-Vote Override: "
-            "eligibility checks are bypassed and the submission is immediately "
-            "forced into the specified terminal state. "
-            "Must only be set by a trusted admin caller."
-        ),
-    )
     note: str | None = Field(
         default=None,
         description="Optional human-readable comment accompanying the vote.",

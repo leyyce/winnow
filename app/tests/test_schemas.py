@@ -28,7 +28,7 @@ def _metadata(**overrides) -> dict:
     base = dict(
         project_id="tree-app",
         submission_id=uuid4(),
-        entity_type="tree_measurement",
+        entity_type="tree",
         entity_id=uuid4(),
         measurement_id=uuid4(),
         submitted_at=_NOW,
@@ -134,14 +134,6 @@ class TestUserContext:
         # role is str — no Literal constraint (project-generic)
         ctx = UserContext.model_validate(_user_context(role="super_custom_role"))
         assert ctx.role == "super_custom_role"
-
-    def test_zero_total_submissions_allowed(self):
-        ctx = UserContext.model_validate(_user_context(total_submissions=0))
-        assert ctx.total_submissions == 0
-
-    def test_negative_total_submissions_rejected(self):
-        with pytest.raises(ValidationError, match="total_submissions"):
-            UserContext.model_validate(_user_context(total_submissions=-1))
 
     def test_missing_account_created_at_rejected(self):
         data = _user_context()
@@ -365,7 +357,7 @@ class TestScoringResultResponse:
         base = dict(
             submission_id=uuid4(),
             project_id="tree-app",
-            entity_type="tree_measurement",
+            entity_type="tree",
             entity_id=uuid4(),
             measurement_id=uuid4(),
             status="pending_review",

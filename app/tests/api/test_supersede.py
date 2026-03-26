@@ -39,7 +39,7 @@ def _valid_envelope(
         "metadata": {
             "project_id": project_id,
             "submission_id": submission_id or str(uuid4()),
-            "entity_type": "tree_measurement",
+            "entity_type": "tree",
             "entity_id": entity_id or str(uuid4()),
             "measurement_id": measurement_id or str(uuid4()),
             "submitted_at": datetime(2024, 1, 1, tzinfo=timezone.utc).isoformat(),
@@ -49,7 +49,6 @@ def _valid_envelope(
             "username": ctx.username,
             "role": ctx.role,
             "trust_level": ctx.trust_level,
-            "total_submissions": ctx.total_submissions,
             "account_created_at": ctx.account_created_at.isoformat(),
         },
         "payload": _payload().model_dump(mode="json"),

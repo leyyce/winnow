@@ -27,8 +27,12 @@ class TrustAdvisorConfig:
     penalty_per_rejection: int      # stored as positive int; applied as negative delta
     streak_bonus: int               # extra delta awarded when consecutive_approvals ≥ streak_threshold
     streak_threshold: int           # number of consecutive approvals needed to trigger the bonus
-    min_trust: int                  # project-configured lower bound (returned to client for clamping)
     max_trust: int                  # project-configured upper bound (returned to client for clamping)
+
+    @property
+    # lower bound (returned to client for clamping)
+    def min_trust(self) -> int:
+        return 0
 
 
 @dataclass(frozen=True)

@@ -40,7 +40,7 @@ class TaskItem(BaseModel):
     )
     entity_type: str = Field(
         min_length=1,
-        description="Entity type within the project, e.g. 'tree_measurement'.",
+        description="Entity type within the project, e.g. 'tree'.",
     )
     confidence_score: float = Field(
         ge=0.0,

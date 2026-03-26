@@ -51,35 +51,35 @@ class TreeProjectBuilder(ProjectBuilder):
 
     def build(self) -> ProjectRegistryEntry:
         # ── Scoring weights ──────────────────────────────────────────────────
-        W_HEIGHT = 0.20
-        W_DISTANCE = 0.20
-        W_TRUST = 0.25
-        W_COMMENT = 0.05
-        W_PLAUSIBILITY = 0.30
+        w_height = 0.20
+        w_distance = 0.20
+        w_trust = 0.25
+        w_comment = 0.05
+        w_plausibility = 0.30
 
         # ── Trust-level scale ────────────────────────────────────────────────
-        TRUST_MID = 50
-        TRUST_MAX = 100
+        trust_mid = 50
+        trust_max = 100
 
         rules: list[ScoringRule] = [
-            HeightFactorRule(weight=W_HEIGHT, h_max=72.0),
+            HeightFactorRule(weight=w_height, h_max=72.0),
             DistanceFactorRule(
-                weight=W_DISTANCE,
+                weight=w_distance,
                 measured_score=1.0,
                 estimated_score=0.4,
             ),
             TrustLevelRule(
-                weight=W_TRUST,
-                trust_level_mid=TRUST_MID,
-                trust_level_max=TRUST_MAX,
+                weight=w_trust,
+                trust_level_mid=trust_mid,
+                trust_level_max=trust_max,
             ),
             CommentFactorRule(
-                weight=W_COMMENT,
+                weight=w_comment,
                 measurement_penalty=0.6,
                 photo_penalty_per_photo=0.2,
             ),
             PlausibilityFactorRule(
-                weight=W_PLAUSIBILITY,
+                weight=w_plausibility,
                 alpha_height=0.4,
                 alpha_inclination=0.3,
                 alpha_trunk_diameter=0.3,
@@ -95,9 +95,8 @@ class TreeProjectBuilder(ProjectBuilder):
                 reward_per_approval=1,
                 penalty_per_rejection=3,
                 streak_bonus=2,
-                streak_threshold=5,
-                min_trust=0,
-                max_trust=TRUST_MAX,
+                streak_threshold=3,
+                max_trust=trust_max,
             )
         )
 
@@ -117,9 +116,9 @@ class TreeProjectBuilder(ProjectBuilder):
         governance_policy = GovernancePolicy(
             tiers=[
                 GovernanceTier(
-                    score_threshold=80.0,
+                    confidence_threshold=75.0,
                     review_tier="peer_review",
-                    threshold_score=1,
+                    vote_threshold=1,
                     role_configs={
                         "expert": RoleConfig(weight=1, min_trust=0),
                         "citizen": RoleConfig(weight=1, min_trust=30),
@@ -128,9 +127,9 @@ class TreeProjectBuilder(ProjectBuilder):
                     blocked_roles=BLOCKED,
                 ),
                 GovernanceTier(
-                    score_threshold=50.0,
+                    confidence_threshold=50.0,
                     review_tier="community_review",
-                    threshold_score=2,
+                    vote_threshold=2,
                     role_configs={
                         "expert": RoleConfig(weight=2, min_trust=0),
                         "citizen": RoleConfig(weight=1, min_trust=50),
@@ -139,13 +138,13 @@ class TreeProjectBuilder(ProjectBuilder):
                     blocked_roles=BLOCKED,
                 ),
                 GovernanceTier(
-                    score_threshold=0.0,
+                    confidence_threshold=0.0,
                     review_tier="expert_review",
-                    threshold_score=3,
+                    vote_threshold=3,
                     role_configs={
                         "expert": RoleConfig(weight=3, min_trust=75),
                     },
-                    default_config=RoleConfig(weight=0, min_trust=9999),
+                    # default_config=None,
                     blocked_roles=BLOCKED,
                 ),
             ]
@@ -157,6 +156,6 @@ class TreeProjectBuilder(ProjectBuilder):
             thresholds=thresholds,
             trust_advisor=trust_advisor,
             governance_policy=governance_policy,
-            valid_entity_types=["tree_measurement"],
+            valid_entity_types=["tree"],
             webhook_url="http://localhost:8080/api/winnow/webhook",
         )

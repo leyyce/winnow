@@ -70,21 +70,28 @@ class StatusLedgerWebhookPayload(BaseModel):
     occurred_at: AwareDatetime = Field(
         description="= status_ledger.created_at — ordering anchor for the client.",
     )
-    submission_id: UUID = Field(
-        description="UUID of the submission this event relates to.",
-    )
     project_id: str = Field(
         min_length=1,
         description="Project identifier.",
     )
+    submission_id: UUID = Field(
+        description="UUID of the submission this event relates to.",
+    )
+    entity_type: str = Field(
+        description="Entity type, e.g. 'tree'.",
+    )
     entity_id: UUID = Field(
         description="Domain entity UUID (part of the identity triplet).",
     )
-    entity_type: str = Field(
-        description="Entity type, e.g. 'tree_measurement'.",
+    measurement_id: UUID = Field(
+        description="Measurement UUID (part of the identity triplet).",
     )
     new_status: str = Field(
         description="The lifecycle status recorded in the ledger entry.",
+    )
+    supersedes: UUID | None = Field(
+        default=None,
+        description="ID of the ledger entry this row replaces (backward pointer).",
     )
     supersede_reason: str | None = Field(
         default=None,

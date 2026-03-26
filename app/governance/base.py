@@ -44,11 +44,11 @@ class GovernanceTier:
 
     Attributes
     ----------
-    score_threshold:
+    confidence_threshold:
         Minimum Confidence Score (0–100) for this tier to apply.
     review_tier:
         Human-readable label, e.g. ``'peer_review'``, ``'expert_review'``.
-    threshold_score:
+    vote_threshold:
         Minimum accumulated role-weight needed to finalise a submission.
     role_configs:
         Per-role weight and min_trust map.  Roles absent fall back to
@@ -60,11 +60,11 @@ class GovernanceTier:
         Roles that are absolutely ineligible — takes precedence over all.
     """
 
-    score_threshold: float
+    confidence_threshold: float
     review_tier: str
-    threshold_score: int
+    vote_threshold: int
     role_configs: dict[str, RoleConfig]
-    default_config: RoleConfig
+    default_config: RoleConfig | None = None
     blocked_roles: list[str] = field(default_factory=list)
 
 
@@ -81,7 +81,7 @@ class GovernancePolicy:
         if not tiers:
             raise ValueError("GovernancePolicy requires at least one GovernanceTier.")
         # Sort descending by score_threshold so iteration is most-restrictive-first
-        self._tiers = sorted(tiers, key=lambda t: t.score_threshold, reverse=True)
+        self._tiers = sorted(tiers, key=lambda t: t.confidence_threshold, reverse=True)
 
     def determine_requirements(
         self,
@@ -101,14 +101,14 @@ class GovernancePolicy:
         """
         matching = [
             RequiredValidations(
-                threshold_score=t.threshold_score,
+                threshold_score=t.vote_threshold,
                 role_configs=t.role_configs,
                 default_config=t.default_config,
                 blocked_roles=t.blocked_roles,
                 review_tier=t.review_tier,
             )
             for t in self._tiers
-            if confidence_score >= t.score_threshold
+            if confidence_score >= t.confidence_threshold
         ]
 
         if not matching:
@@ -116,7 +116,7 @@ class GovernancePolicy:
             fallback = self._tiers[-1]
             matching = [
                 RequiredValidations(
-                    threshold_score=fallback.threshold_score,
+                    threshold_score=fallback.vote_threshold,
                     role_configs=fallback.role_configs,
                     default_config=fallback.default_config,
                     blocked_roles=fallback.blocked_roles,
@@ -126,8 +126,8 @@ class GovernancePolicy:
 
         return matching
 
+    @staticmethod
     def get_vote_weight(
-        self,
         requirements: RequiredValidations,
         reviewer_role: str,
         reviewer_trust: int,
@@ -154,6 +154,11 @@ class GovernancePolicy:
         # Step 2: role-specific or default config
         cfg = requirements.role_configs.get(reviewer_role, requirements.default_config)
 
+        if cfg is None:
+            raise NotEligibleError(
+                f"Role '{reviewer_role}' is not configured for voting."
+            )
+
         # Step 3: trust floor
         if reviewer_trust < cfg.min_trust:
             raise NotEligibleError(
@@ -170,7 +175,7 @@ class GovernancePolicy:
         return cfg.weight
 
     def reaches_threshold(self, threshold: int) -> bool:
-        lowest_tier_threshold = min(t.score_threshold for t in self._tiers)
+        lowest_tier_threshold = min(t.confidence_threshold for t in self._tiers)
 
         return lowest_tier_threshold <= threshold
 
